@@ -14,7 +14,7 @@ from llm_das_dinomaly.enhancer import MapFeatureHead, build_enhancer_features, f
 from llm_das_dinomaly.enhancer.heads import binary_enhancer_loss
 from llm_das_dinomaly.integrations import build_dinomaly_wrapper
 from llm_das_dinomaly.search import NormalScoreStats, SearchConfig, score_aware_search
-from llm_das_dinomaly.utils import load_yaml_config, require_path, seed_everything
+from llm_das_dinomaly.utils import ProgressBar, load_yaml_config, require_path, seed_everything
 
 
 def main(argv: Optional[List[str]] = None) -> None:
@@ -56,6 +56,7 @@ def run_pipeline(cfg: Dict[str, Any], *, stage: str = "all") -> Dict[str, Any]:
         categories = list(MVTEC_CLASSES) if categories == ["bottle"] else categories
         limit_per_category = None
     batch_size = int(runtime.get("batch_size", 4))
+    show_progress = _as_bool(runtime.get("progress", True))
 
     dataset = MVTecGoodDataset(data_root, categories=categories, limit_per_category=limit_per_category)
     summary: Dict[str, Any] = {
@@ -73,6 +74,8 @@ def run_pipeline(cfg: Dict[str, Any], *, stage: str = "all") -> Dict[str, Any]:
         _write_json(summary_path, summary)
         return summary
 
+    if show_progress:
+        print("[llm-das-dinomaly] loading Dinomaly checkpoint...", flush=True)
     wrapper, wrapper_meta = build_dinomaly_wrapper(
         dinomaly_root=dinomaly_root,
         checkpoint_path=checkpoint_path,
@@ -93,6 +96,7 @@ def run_pipeline(cfg: Dict[str, Any], *, stage: str = "all") -> Dict[str, Any]:
             generator=generator,
             search_budget=int(hard_cfg.get("search_budget", 4)),
             max_samples=_resolve_max_samples(hard_cfg.get("max_samples", 8), mode=mode),
+            show_progress=show_progress,
         )
         summary["hard_samples"] = hard_summary
 
@@ -106,6 +110,7 @@ def run_pipeline(cfg: Dict[str, Any], *, stage: str = "all") -> Dict[str, Any]:
             hidden_dim=int(enhancer_cfg.get("hidden_dim", 128)),
             lr=float(enhancer_cfg.get("lr", 1e-3)),
             seed=seed,
+            show_progress=show_progress,
         )
         summary["enhancer"] = enhancer_summary
 
@@ -123,11 +128,15 @@ def generate_hard_samples(
     generator: torch.Generator,
     search_budget: int,
     max_samples: int,
+    show_progress: bool = True,
 ) -> Dict[str, Any]:
+    target_samples = min(len(dataset), max_samples)
+    target_batches = (target_samples + batch_size - 1) // batch_size
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=_collate_pil)
     normal_scores = []
     preprocessed = []
     meta_records = []
+    normal_progress = ProgressBar(target_batches, label="normal scoring", enabled=show_progress)
     with torch.no_grad():
         for images, metas in loader:
             x = wrapper.preprocess(images).to(device)
@@ -135,8 +144,10 @@ def generate_hard_samples(
             normal_scores.append(scores.detach().cpu())
             preprocessed.append(x.detach().cpu())
             meta_records.extend(metas)
+            normal_progress.update(suffix=f"images={min(sum(batch.shape[0] for batch in preprocessed), target_samples)}")
             if sum(batch.shape[0] for batch in preprocessed) >= max(max_samples, batch_size):
                 break
+    normal_progress.close()
 
     all_scores = torch.cat(normal_scores, dim=0)
     stats = NormalScoreStats.from_scores(all_scores)
@@ -151,6 +162,11 @@ def generate_hard_samples(
     feature_vectors = []
     labels = []
 
+    search_progress = ProgressBar(
+        x_all.shape[0],
+        label=f"hard search budget={search_budget}",
+        enabled=show_progress,
+    )
     for idx in range(x_all.shape[0]):
         x_ref = x_all[idx : idx + 1].to(device)
         candidate = score_aware_search(
@@ -188,6 +204,8 @@ def generate_hard_samples(
             ]
         )
         labels.extend([torch.zeros(1), torch.ones(1)])
+        search_progress.update(suffix=f"candidate={idx + 1}")
+    search_progress.close()
 
     tensors = {
         "normal_images": x_all.cpu(),
@@ -223,6 +241,7 @@ def train_enhancer_from_cache(
     hidden_dim: int,
     lr: float,
     seed: int,
+    show_progress: bool = True,
 ) -> Dict[str, Any]:
     seed_everything(seed)
     payload = torch.load(cache_path, map_location="cpu")
@@ -231,6 +250,7 @@ def train_enhancer_from_cache(
     head = MapFeatureHead(input_dim=x.shape[1], hidden_dim=hidden_dim)
     opt = torch.optim.AdamW(head.parameters(), lr=lr)
     losses = []
+    progress = ProgressBar(epochs, label="enhancer training", enabled=show_progress)
     for _ in range(epochs):
         logits = head(x)
         loss = binary_enhancer_loss(logits, labels)
@@ -238,6 +258,8 @@ def train_enhancer_from_cache(
         loss.backward()
         opt.step()
         losses.append(float(loss.item()))
+        progress.update(suffix=f"loss={losses[-1]:.6f}")
+    progress.close()
 
     with torch.no_grad():
         aux = torch.sigmoid(head(x))
@@ -276,6 +298,14 @@ def _resolve_max_samples(value: Any, *, mode: str) -> int:
     if mode == "full" and (value is None or str(value).lower() in {"all", "none", "-1"}):
         return 10**12
     return int(value)
+
+
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() not in {"0", "false", "no", "off"}
+    return bool(value)
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ runtime:
   seed: 7
   batch_size: 2
   output_root: ${OUTPUT_ROOT:-outputs/server_mvtec}
+  progress: ${PROGRESS:-true}
 
 model:
   dinomaly_root: ${DINOMALY_ROOT:-third_party/Dinomaly}
