@@ -2,13 +2,30 @@
 set -euo pipefail
 
 CONFIG_PATH="${1:-configs/server_mvtec.yaml}"
-RUN_MODE="${RUN_MODE:-smoke}"
-export RUN_MODE
+ENV_FILE="${2:-${SERVER_ENV_FILE:-}}"
+
+if [[ -z "${ENV_FILE}" && -f "configs/server_paths.env" ]]; then
+  ENV_FILE="configs/server_paths.env"
+fi
 
 if [[ ! -f "${CONFIG_PATH}" ]]; then
   echo "Config not found: ${CONFIG_PATH}" >&2
   exit 2
 fi
+
+if [[ -n "${ENV_FILE}" ]]; then
+  if [[ ! -f "${ENV_FILE}" ]]; then
+    echo "Env file not found: ${ENV_FILE}" >&2
+    exit 2
+  fi
+  set -a
+  # shellcheck disable=SC1090
+  source "${ENV_FILE}"
+  set +a
+fi
+
+RUN_MODE="${RUN_MODE:-smoke}"
+export RUN_MODE
 
 : "${DATA_ROOT:?Set DATA_ROOT to the MVTec root, e.g. /data/mvtec_anomaly_detection}"
 : "${CHECKPOINT_PATH:?Set CHECKPOINT_PATH to a trained Dinomaly checkpoint .pth}"
@@ -27,6 +44,9 @@ if [[ "${RUN_MODE}" == "smoke" ]]; then
 fi
 
 echo "[llm-das-dinomaly] config=${CONFIG_PATH}"
+if [[ -n "${ENV_FILE}" ]]; then
+  echo "[llm-das-dinomaly] env_file=${ENV_FILE}"
+fi
 echo "[llm-das-dinomaly] mode=${RUN_MODE}"
 echo "[llm-das-dinomaly] data=${DATA_ROOT}"
 echo "[llm-das-dinomaly] checkpoint=${CHECKPOINT_PATH}"

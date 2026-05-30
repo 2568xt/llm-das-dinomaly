@@ -58,10 +58,16 @@ official Dinomaly dependencies, then launch a smoke run:
 
 ```bash
 pip install -e .
-DATA_ROOT=/path/to/mvtec_anomaly_detection \
-CHECKPOINT_PATH=/path/to/dinomaly_checkpoint.pth \
-OUTPUT_ROOT=/path/to/llm_das_dinomaly_out \
-bash scripts/run_server_mvtec.sh configs/server_mvtec.yaml
+cp configs/server_paths.example.env configs/server_paths.env
+# Edit configs/server_paths.env with server-local paths.
+bash scripts/run_server_mvtec.sh configs/server_mvtec.yaml configs/server_paths.env
+```
+
+If `configs/server_paths.env` exists, `scripts/run_server_mvtec.sh` also loads
+it automatically, so this shorter command works after the first edit:
+
+```bash
+bash scripts/run_server_mvtec.sh
 ```
 
 Optional environment overrides:

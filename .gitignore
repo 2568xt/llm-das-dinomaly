@@ -19,3 +19,8 @@ dist/
 /cache/
 /answer/
 /prompt/4code/
+
+# Server-local path files. Keep examples tracked, but not real machine paths.
+/configs/server_paths.env
+/.env.server
+/.env.local
