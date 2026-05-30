@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from PIL import Image
 
 from llm_das_dinomaly.wrappers import DinomalyConfig, DinomalyWrapper
 
@@ -21,6 +22,13 @@ def test_preprocess_crop_and_normalize_shape():
     out = wrapper.preprocess(x)
     assert out.shape == (2, 3, 28, 28)
     assert torch.isfinite(out).all()
+
+
+def test_preprocess_pil_list_with_mixed_sizes():
+    wrapper = DinomalyWrapper(DummyDinomaly(), DinomalyConfig(image_size=32, crop_size=28, patch_size=7))
+    images = [Image.new("RGB", (64, 64)), Image.new("RGB", (48, 40))]
+    out = wrapper.preprocess(images)
+    assert out.shape == (2, 3, 28, 28)
 
 
 def test_predict_map_score_and_features():

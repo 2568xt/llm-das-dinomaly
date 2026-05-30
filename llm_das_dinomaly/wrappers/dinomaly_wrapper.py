@@ -257,7 +257,14 @@ class DinomalyWrapper(nn.Module):
             if not isinstance(image, Image.Image):
                 raise TypeError("image sequences must contain PIL.Image.Image objects")
             arr = np.asarray(image.convert("RGB"), dtype=np.float32) / 255.0
-            tensors.append(torch.from_numpy(arr).permute(2, 0, 1))
+            tensor = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)
+            tensor = F.interpolate(
+                tensor,
+                size=(self.cfg.image_size, self.cfg.image_size),
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(0)
+            tensors.append(tensor)
         if not tensors:
             raise ValueError("at least one image is required")
         return torch.stack(tensors, dim=0)
