@@ -46,9 +46,6 @@ def run_pipeline(cfg: Dict[str, Any], *, stage: str = "all") -> Dict[str, Any]:
     device = str(runtime.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
     mode = str(runtime.get("mode", "smoke")).lower()
     generator = seed_everything(seed)
-    if str(device).startswith("cuda") and torch.cuda.is_available():
-        generator = torch.Generator(device=device)
-        generator.manual_seed(seed)
 
     data_root = require_path(data_cfg["root"], kind="DATA_ROOT")
     checkpoint_path = require_path(model_cfg["checkpoint_path"], kind="CHECKPOINT_PATH", must_be_file=True)
@@ -161,7 +158,7 @@ def generate_hard_samples(
             x_ref,
             stats,
             config=SearchConfig(budget=search_budget),
-            generator=generator,
+            generator=None if x_ref.is_cuda else generator,
         )
         candidates.append(candidate.x.detach().cpu())
         masks.append(candidate.mask.detach().cpu())
