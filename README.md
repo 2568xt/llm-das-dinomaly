@@ -78,6 +78,7 @@ Optional environment overrides:
 - `RUN_MODE`: defaults to `smoke`.
 - `MAX_SAMPLES`: defaults to `4`; use `all` for a full run.
 - `SEARCH_BUDGET`: defaults to `4`.
+- `PROGRESS`: defaults to `true`; set to `false` to disable terminal progress bars.
 
 The run writes `hard_samples.pt`, `enhancer.pt`, and `run_summary.json` under
 `OUTPUT_ROOT`.
