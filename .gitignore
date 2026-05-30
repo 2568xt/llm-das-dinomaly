@@ -1,0 +1,21 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+
+# Local datasets, checkpoints, and generated experiment artifacts.
+/data/
+/datasets/
+/checkpoints/
+/outputs/
+/runs/
+/cache/
+/answer/
+/prompt/4code/

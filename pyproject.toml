@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llm-das-dinomaly"
+version = "0.1.0"
+description = "Detector-aware synthetic anomaly tooling for Dinomaly-style image UAD."
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "numpy>=1.18",
+    "Pillow>=8",
+    "PyYAML>=5.4",
+    "torch>=1.12",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7",
+]
+llm = [
+    "openai>=1",
+]
+vision = [
+    "torchvision>=0.13",
+    "timm>=0.9.12",
+]
+
+[tool.setuptools.packages.find]
+include = ["llm_das_dinomaly*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

@@ -1,0 +1,26 @@
+runtime:
+  mode: ${RUN_MODE:-smoke}
+  device: ${DEVICE:-cuda}
+  seed: 7
+  batch_size: 2
+  output_root: ${OUTPUT_ROOT:-outputs/server_mvtec}
+
+model:
+  dinomaly_root: ${DINOMALY_ROOT:-third_party/Dinomaly}
+  checkpoint_path: ${CHECKPOINT_PATH}
+  backbone: dinov2reg_vit_base_14
+  strict_checkpoint: false
+
+data:
+  root: ${DATA_ROOT}
+  categories: ["${MVTEC_CATEGORY:-bottle}"]
+  limit_per_category: 4
+
+hard_samples:
+  search_budget: ${SEARCH_BUDGET:-4}
+  max_samples: ${MAX_SAMPLES:-4}
+
+enhancer:
+  epochs: 1
+  hidden_dim: 128
+  lr: 0.001

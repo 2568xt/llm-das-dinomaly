@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONFIG_PATH="${1:-configs/server_mvtec.yaml}"
+RUN_MODE="${RUN_MODE:-smoke}"
+export RUN_MODE
+
+if [[ ! -f "${CONFIG_PATH}" ]]; then
+  echo "Config not found: ${CONFIG_PATH}" >&2
+  exit 2
+fi
+
+: "${DATA_ROOT:?Set DATA_ROOT to the MVTec root, e.g. /data/mvtec_anomaly_detection}"
+: "${CHECKPOINT_PATH:?Set CHECKPOINT_PATH to a trained Dinomaly checkpoint .pth}"
+: "${OUTPUT_ROOT:?Set OUTPUT_ROOT to a writable output directory}"
+: "${DINOMALY_ROOT:=third_party/Dinomaly}"
+export DINOMALY_ROOT
+
+if [[ ! -d "${DINOMALY_ROOT}" ]]; then
+  echo "Dinomaly root not found: ${DINOMALY_ROOT}" >&2
+  echo "Run: git submodule update --init --recursive" >&2
+  exit 2
+fi
+
+if [[ "${RUN_MODE}" == "smoke" ]]; then
+  export MVTEC_CATEGORY="${MVTEC_CATEGORY:-bottle}"
+fi
+
+echo "[llm-das-dinomaly] config=${CONFIG_PATH}"
+echo "[llm-das-dinomaly] mode=${RUN_MODE}"
+echo "[llm-das-dinomaly] data=${DATA_ROOT}"
+echo "[llm-das-dinomaly] checkpoint=${CHECKPOINT_PATH}"
+echo "[llm-das-dinomaly] output=${OUTPUT_ROOT}"
+echo "[llm-das-dinomaly] dinomaly=${DINOMALY_ROOT}"
+
+python -m llm_das_dinomaly.pipelines.server_mvtec --config "${CONFIG_PATH}" --stage check
+python -m llm_das_dinomaly.pipelines.server_mvtec --config "${CONFIG_PATH}" --stage all
