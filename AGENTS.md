@@ -25,6 +25,18 @@ python3 -m compileall -q llm_das_dinomaly scripts tests
 For server-runner changes, also run the relevant dry-run or path-validation
 command locally when possible.
 
+## Project Shape
+
+- Core package code lives under `llm_das_dinomaly/`.
+- CLI and server runner scripts live under `scripts/`.
+- Third-party Dinomaly code lives under `third_party/Dinomaly/`; prefer wrapping or integration code outside this directory.
+- Project docs live under `docs/`.
+
+## Local Artifact Rules
+
+- Treat `outputs/`, `checkpoints/`, `__pycache__/`, and `.pytest_cache/` as local/generated artifacts.
+- Do not add generated experiment outputs to git unless the user explicitly asks for a curated artifact.
+
 ## Server Notes
 
 - The GPU server should pull from `main` only after the PR is merged.
