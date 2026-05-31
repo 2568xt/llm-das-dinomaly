@@ -2,14 +2,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
+import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
 import torch
-from torch.utils.data import DataLoader
 
 from llm_das_dinomaly.data.mvtec import MVTEC_CLASSES
-from llm_das_dinomaly.data import MVTecGoodDataset, save_tensor_cache
+from llm_das_dinomaly.data import MVTecGoodDataset, load_tensor_cache, save_tensor_cache, save_torch_payload
 from llm_das_dinomaly.enhancer import MapFeatureHead, build_enhancer_features, fuse_scores
 from llm_das_dinomaly.enhancer.heads import binary_enhancer_loss
 from llm_das_dinomaly.integrations import build_dinomaly_wrapper
@@ -74,44 +75,76 @@ def run_pipeline(cfg: Dict[str, Any], *, stage: str = "all") -> Dict[str, Any]:
         _write_json(summary_path, summary)
         return summary
 
-    if show_progress:
-        print("[llm-das-dinomaly] loading Dinomaly checkpoint...", flush=True)
-    wrapper, wrapper_meta = build_dinomaly_wrapper(
-        dinomaly_root=dinomaly_root,
-        checkpoint_path=checkpoint_path,
-        device=device,
-        backbone=str(model_cfg.get("backbone", "dinov2reg_vit_base_14")),
-        strict=bool(model_cfg.get("strict_checkpoint", False)),
-    )
-    summary["wrapper"] = wrapper_meta
+    wrapper_pair = None
+
+    def get_wrapper():
+        nonlocal wrapper_pair
+        if wrapper_pair is None:
+            if show_progress:
+                print("[llm-das-dinomaly] loading Dinomaly checkpoint...", file=sys.stderr, flush=True)
+            wrapper_pair = build_dinomaly_wrapper(
+                dinomaly_root=dinomaly_root,
+                checkpoint_path=checkpoint_path,
+                device=device,
+                backbone=str(model_cfg.get("backbone", "dinov2reg_vit_base_14")),
+                strict=bool(model_cfg.get("strict_checkpoint", False)),
+            )
+            summary["wrapper"] = wrapper_pair[1]
+        return wrapper_pair[0]
 
     hard_cache = output_root / "hard_samples.pt"
+    enhancer_path = output_root / "enhancer.pt"
+    regenerate_hard = _as_bool(hard_cfg.get("regenerate", False))
+    retrain_enhancer = _as_bool(enhancer_cfg.get("retrain", False))
+    hard_search_budget = int(hard_cfg.get("search_budget", 4))
+    hard_max_samples = _resolve_max_samples(hard_cfg.get("max_samples", 8), mode=mode)
+    hard_target_samples = min(len(dataset), hard_max_samples)
+    cache_images = _as_bool(hard_cfg.get("cache_images", False))
+    hard_shard_size = int(hard_cfg.get("shard_size", 32))
+
     if stage in ("hard-samples", "all"):
-        hard_summary = generate_hard_samples(
-            wrapper,
-            dataset,
-            hard_cache,
-            batch_size=batch_size,
-            device=device,
-            generator=generator,
-            search_budget=int(hard_cfg.get("search_budget", 4)),
-            max_samples=_resolve_max_samples(hard_cfg.get("max_samples", 8), mode=mode),
-            show_progress=show_progress,
-        )
+        hard_summary = None
+        if regenerate_hard:
+            _clear_hard_sample_artifacts(hard_cache)
+        elif hard_cache.is_file():
+            hard_summary = _try_summarize_hard_cache(
+                hard_cache,
+                target_samples=hard_target_samples,
+                search_budget=hard_search_budget,
+                cache_images=cache_images,
+            )
+        if hard_summary is None:
+            hard_summary = generate_hard_samples(
+                get_wrapper(),
+                dataset,
+                hard_cache,
+                batch_size=batch_size,
+                device=device,
+                generator=generator,
+                search_budget=hard_search_budget,
+                max_samples=hard_max_samples,
+                cache_images=cache_images,
+                shard_size=hard_shard_size,
+                show_progress=show_progress,
+            )
         summary["hard_samples"] = hard_summary
 
     if stage in ("enhancer", "all"):
         if not hard_cache.is_file():
             raise FileNotFoundError(f"hard sample cache does not exist: {hard_cache}")
-        enhancer_summary = train_enhancer_from_cache(
-            hard_cache,
-            output_root / "enhancer.pt",
-            epochs=int(enhancer_cfg.get("epochs", 1)),
-            hidden_dim=int(enhancer_cfg.get("hidden_dim", 128)),
-            lr=float(enhancer_cfg.get("lr", 1e-3)),
-            seed=seed,
-            show_progress=show_progress,
-        )
+        enhancer_summary = None
+        if enhancer_path.is_file() and not retrain_enhancer:
+            enhancer_summary = _try_summarize_enhancer_checkpoint(enhancer_path)
+        if enhancer_summary is None:
+            enhancer_summary = train_enhancer_from_cache(
+                hard_cache,
+                enhancer_path,
+                epochs=int(enhancer_cfg.get("epochs", 1)),
+                hidden_dim=int(enhancer_cfg.get("hidden_dim", 128)),
+                lr=float(enhancer_cfg.get("lr", 1e-3)),
+                seed=seed,
+                show_progress=show_progress,
+            )
         summary["enhancer"] = enhancer_summary
 
     _write_json(summary_path, summary)
@@ -128,109 +161,135 @@ def generate_hard_samples(
     generator: torch.Generator,
     search_budget: int,
     max_samples: int,
+    cache_images: bool = False,
+    shard_size: int = 32,
     show_progress: bool = True,
 ) -> Dict[str, Any]:
     target_samples = min(len(dataset), max_samples)
+    if target_samples <= 0:
+        raise ValueError("max_samples must select at least one MVTec train/good image")
+    batch_size = max(1, int(batch_size))
+    shard_size = max(1, int(shard_size))
     target_batches = (target_samples + batch_size - 1) // batch_size
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=_collate_pil)
+    shard_dir = _hard_sample_shard_dir(output_path)
+
     normal_scores = []
-    preprocessed = []
-    meta_records = []
     normal_progress = ProgressBar(target_batches, label="normal scoring", enabled=show_progress)
+    normal_seen = 0
     with torch.no_grad():
-        for images, metas in loader:
+        for _, images, _ in _iter_dataset_batches(dataset, target_samples, batch_size):
             x = wrapper.preprocess(images).to(device)
             scores = wrapper.predict_score(x)
             normal_scores.append(scores.detach().cpu())
-            preprocessed.append(x.detach().cpu())
-            meta_records.extend(metas)
-            normal_progress.update(suffix=f"images={min(sum(batch.shape[0] for batch in preprocessed), target_samples)}")
-            if sum(batch.shape[0] for batch in preprocessed) >= max(max_samples, batch_size):
-                break
+            normal_seen += x.shape[0]
+            normal_progress.update(suffix=f"images={normal_seen}")
     normal_progress.close()
 
     all_scores = torch.cat(normal_scores, dim=0)
     stats = NormalScoreStats.from_scores(all_scores)
-    x_all = torch.cat(preprocessed, dim=0)[:max_samples]
-    meta_records = meta_records[: x_all.shape[0]]
+    completed_indices = _load_completed_sample_indices(
+        shard_dir,
+        target_samples=target_samples,
+        search_budget=search_budget,
+        cache_images=cache_images,
+    )
 
-    candidates = []
-    masks = []
-    hardness = []
-    base_scores = []
-    aux_maps = []
-    feature_vectors = []
-    labels = []
+    buffer = _new_hard_sample_buffer(cache_images=cache_images)
+    generated_count = 0
 
     search_progress = ProgressBar(
-        x_all.shape[0],
+        target_samples,
         label=f"hard search budget={search_budget}",
         enabled=show_progress,
     )
-    for idx in range(x_all.shape[0]):
-        x_ref = x_all[idx : idx + 1].to(device)
-        candidate = score_aware_search(
-            wrapper,
-            x_ref,
-            stats,
-            config=SearchConfig(budget=search_budget),
-            generator=None if x_ref.is_cuda else generator,
-        )
-        candidates.append(candidate.x.detach().cpu())
-        masks.append(candidate.mask.detach().cpu())
-        hardness.append(candidate.hardness.detach().cpu())
+    cached_count = len(completed_indices)
+    if cached_count:
+        search_progress.update(cached_count, suffix=f"cached={cached_count}")
 
-        normal_map = wrapper.predict_map(x_ref)
-        normal_score = wrapper.predict_score(x_ref)
-        normal_feats = wrapper.extract_features(x_ref, which="encoder")
-        synth_map = wrapper.predict_map(candidate.x)
-        synth_score = wrapper.predict_score(candidate.x)
-        synth_feats = wrapper.extract_features(candidate.x, which="encoder")
-
-        base_scores.extend([normal_score.detach().cpu(), synth_score.detach().cpu()])
-        aux_maps.extend([normal_map.detach().cpu(), synth_map.detach().cpu()])
-        feature_vectors.extend(
-            [
-                build_enhancer_features(
-                    normal_score.detach().cpu(),
-                    normal_map.detach().cpu(),
-                    encoder_groups=[feat.detach().cpu() for feat in normal_feats],
-                ),
-                build_enhancer_features(
-                    synth_score.detach().cpu(),
-                    synth_map.detach().cpu(),
-                    encoder_groups=[feat.detach().cpu() for feat in synth_feats],
-                ),
+    with torch.no_grad():
+        for start, images, metas in _iter_dataset_batches(dataset, target_samples, batch_size):
+            pending = [
+                (start + offset, image, meta)
+                for offset, (image, meta) in enumerate(zip(images, metas))
+                if start + offset not in completed_indices
             ]
+            if not pending:
+                continue
+
+            x_batch = wrapper.preprocess([image for _, image, _ in pending]).to(device)
+            for row, (idx, _, meta) in enumerate(pending):
+                x_ref = x_batch[row : row + 1]
+                candidate = score_aware_search(
+                    wrapper,
+                    x_ref,
+                    stats,
+                    config=SearchConfig(budget=search_budget),
+                    generator=None if x_ref.is_cuda else generator,
+                )
+
+                normal_map = wrapper.predict_map(x_ref)
+                normal_score = wrapper.predict_score(x_ref)
+                normal_feats = wrapper.extract_features(x_ref, which="encoder")
+                synth_map = wrapper.predict_map(candidate.x)
+                synth_score = wrapper.predict_score(candidate.x)
+                synth_feats = wrapper.extract_features(candidate.x, which="encoder")
+
+                _append_hard_sample(
+                    buffer,
+                    sample_index=idx,
+                    source_record=meta,
+                    x_ref=x_ref,
+                    candidate_x=candidate.x,
+                    candidate_mask=candidate.mask,
+                    hardness=candidate.hardness,
+                    normal_score=normal_score,
+                    normal_map=normal_map,
+                    normal_feats=normal_feats,
+                    synth_score=synth_score,
+                    synth_map=synth_map,
+                    synth_feats=synth_feats,
+                )
+                generated_count += 1
+                search_progress.update(suffix=f"candidate={idx + 1} generated={generated_count}")
+
+                if _hard_sample_buffer_len(buffer) >= shard_size:
+                    saved_indices = _save_hard_sample_shard(
+                        shard_dir,
+                        buffer,
+                        stats=stats,
+                        search_budget=search_budget,
+                        cache_images=cache_images,
+                    )
+                    completed_indices.update(saved_indices)
+                    buffer = _new_hard_sample_buffer(cache_images=cache_images)
+
+    if _hard_sample_buffer_len(buffer):
+        saved_indices = _save_hard_sample_shard(
+            shard_dir,
+            buffer,
+            stats=stats,
+            search_budget=search_budget,
+            cache_images=cache_images,
         )
-        labels.extend([torch.zeros(1), torch.ones(1)])
-        search_progress.update(suffix=f"candidate={idx + 1}")
+        completed_indices.update(saved_indices)
     search_progress.close()
 
-    tensors = {
-        "normal_images": x_all.cpu(),
-        "synthetic_images": torch.cat(candidates, dim=0),
-        "masks": torch.cat(masks, dim=0),
-        "hardness": torch.cat(hardness, dim=0),
-        "enhancer_features": torch.cat(feature_vectors, dim=0),
-        "labels": torch.cat(labels, dim=0),
-        "base_scores": torch.cat(base_scores, dim=0),
-        "anomaly_maps": torch.cat(aux_maps, dim=0),
-    }
-    metadata = {
-        "normal_stats": stats.__dict__,
-        "num_candidates": int(tensors["synthetic_images"].shape[0]),
-        "source_records": meta_records,
-        "search_budget": search_budget,
-    }
-    save_tensor_cache(output_path, tensors, metadata)
-    return {
-        "cache_path": str(output_path),
-        "num_candidates": metadata["num_candidates"],
-        "normal_score_mean": stats.mean,
-        "normal_score_std": stats.std,
-        "accepted_proxy": int((tensors["hardness"] > 0).sum().item()),
-    }
+    missing = sorted(set(range(target_samples)) - completed_indices)
+    if missing:
+        preview = ", ".join(str(idx) for idx in missing[:8])
+        raise RuntimeError(f"hard sample shards are incomplete; missing sample indices: {preview}")
+
+    summary = _merge_hard_sample_shards(
+        shard_dir,
+        output_path,
+        target_samples=target_samples,
+        stats=stats,
+        search_budget=search_budget,
+        cache_images=cache_images,
+    )
+    summary["generated_candidates"] = generated_count
+    summary["resumed_from_shards"] = cached_count > 0
+    return summary
 
 
 def train_enhancer_from_cache(
@@ -244,7 +303,7 @@ def train_enhancer_from_cache(
     show_progress: bool = True,
 ) -> Dict[str, Any]:
     seed_everything(seed)
-    payload = torch.load(cache_path, map_location="cpu")
+    payload = load_tensor_cache(cache_path)
     x = payload["tensors"]["enhancer_features"].float()
     labels = payload["tensors"]["labels"].float()
     head = MapFeatureHead(input_dim=x.shape[1], hidden_dim=hidden_dim)
@@ -264,8 +323,8 @@ def train_enhancer_from_cache(
     with torch.no_grad():
         aux = torch.sigmoid(head(x))
         fused = fuse_scores(payload["tensors"]["base_scores"].float(), aux)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
+    save_torch_payload(
+        output_path,
         {
             "state_dict": head.state_dict(),
             "input_dim": x.shape[1],
@@ -273,10 +332,10 @@ def train_enhancer_from_cache(
             "epochs": epochs,
             "losses": losses,
         },
-        output_path,
     )
     return {
         "checkpoint_path": str(output_path),
+        "reused": False,
         "input_dim": int(x.shape[1]),
         "epochs": epochs,
         "final_loss": losses[-1],
@@ -284,9 +343,345 @@ def train_enhancer_from_cache(
     }
 
 
-def _collate_pil(batch):
-    images, metas = zip(*batch)
-    return list(images), list(metas)
+def _iter_dataset_batches(
+    dataset: MVTecGoodDataset,
+    total: int,
+    batch_size: int,
+) -> Iterator[Tuple[int, List[Any], List[Dict[str, Any]]]]:
+    for start in range(0, total, batch_size):
+        items = [dataset[idx] for idx in range(start, min(start + batch_size, total))]
+        images, metas = zip(*items)
+        yield start, list(images), list(metas)
+
+
+def _hard_sample_shard_dir(output_path: Path) -> Path:
+    return output_path.parent / f"{output_path.stem}_shards"
+
+
+def _new_hard_sample_buffer(*, cache_images: bool) -> Dict[str, List[Any]]:
+    buffer: Dict[str, List[Any]] = {
+        "sample_indices": [],
+        "source_records": [],
+        "hardness": [],
+        "enhancer_features": [],
+        "labels": [],
+        "base_scores": [],
+    }
+    if cache_images:
+        buffer.update(
+            {
+                "normal_images": [],
+                "synthetic_images": [],
+                "masks": [],
+                "anomaly_maps": [],
+            }
+        )
+    return buffer
+
+
+def _hard_sample_buffer_len(buffer: Dict[str, List[Any]]) -> int:
+    return len(buffer["sample_indices"])
+
+
+def _append_hard_sample(
+    buffer: Dict[str, List[Any]],
+    *,
+    sample_index: int,
+    source_record: Dict[str, Any],
+    x_ref: torch.Tensor,
+    candidate_x: torch.Tensor,
+    candidate_mask: torch.Tensor,
+    hardness: torch.Tensor,
+    normal_score: torch.Tensor,
+    normal_map: torch.Tensor,
+    normal_feats: Sequence[torch.Tensor],
+    synth_score: torch.Tensor,
+    synth_map: torch.Tensor,
+    synth_feats: Sequence[torch.Tensor],
+) -> None:
+    source = dict(source_record)
+    source["sample_index"] = int(sample_index)
+    buffer["sample_indices"].append(int(sample_index))
+    buffer["source_records"].append(source)
+    buffer["hardness"].append(hardness.detach().cpu().reshape(-1))
+    buffer["base_scores"].extend([normal_score.detach().cpu().reshape(-1), synth_score.detach().cpu().reshape(-1)])
+    buffer["enhancer_features"].extend(
+        [
+            build_enhancer_features(
+                normal_score.detach().cpu(),
+                normal_map.detach().cpu(),
+                encoder_groups=[feat.detach().cpu() for feat in normal_feats],
+            ),
+            build_enhancer_features(
+                synth_score.detach().cpu(),
+                synth_map.detach().cpu(),
+                encoder_groups=[feat.detach().cpu() for feat in synth_feats],
+            ),
+        ]
+    )
+    buffer["labels"].extend([torch.zeros(1), torch.ones(1)])
+
+    if "normal_images" in buffer:
+        buffer["normal_images"].append(x_ref.detach().cpu())
+        buffer["synthetic_images"].append(candidate_x.detach().cpu())
+        buffer["masks"].append(candidate_mask.detach().cpu())
+        buffer["anomaly_maps"].extend([normal_map.detach().cpu(), synth_map.detach().cpu()])
+
+
+def _save_hard_sample_shard(
+    shard_dir: Path,
+    buffer: Dict[str, List[Any]],
+    *,
+    stats: NormalScoreStats,
+    search_budget: int,
+    cache_images: bool,
+) -> Set[int]:
+    indices = [int(idx) for idx in buffer["sample_indices"]]
+    if not indices:
+        return set()
+    shard_dir.mkdir(parents=True, exist_ok=True)
+    shard_path = shard_dir / f"shard-{min(indices):06d}-{max(indices) + 1:06d}.pt"
+    tensors = {
+        "sample_indices": torch.tensor(indices, dtype=torch.long),
+        "hardness": torch.cat(buffer["hardness"], dim=0).float(),
+        "enhancer_features": torch.cat(buffer["enhancer_features"], dim=0).float(),
+        "labels": torch.cat(buffer["labels"], dim=0).float(),
+        "base_scores": torch.cat(buffer["base_scores"], dim=0).float(),
+    }
+    if cache_images:
+        tensors.update(
+            {
+                "normal_images": torch.cat(buffer["normal_images"], dim=0).float(),
+                "synthetic_images": torch.cat(buffer["synthetic_images"], dim=0).float(),
+                "masks": torch.cat(buffer["masks"], dim=0).float(),
+                "anomaly_maps": torch.cat(buffer["anomaly_maps"], dim=0).float(),
+            }
+        )
+    metadata = {
+        "cache_version": 2,
+        "type": "hard_sample_shard",
+        "complete": True,
+        "normal_stats": stats.__dict__,
+        "num_candidates": len(indices),
+        "source_records": list(buffer["source_records"]),
+        "search_budget": int(search_budget),
+        "cache_images": bool(cache_images),
+    }
+    save_tensor_cache(shard_path, tensors, metadata)
+    return set(indices)
+
+
+def _merge_hard_sample_shards(
+    shard_dir: Path,
+    output_path: Path,
+    *,
+    target_samples: int,
+    stats: NormalScoreStats,
+    search_budget: int,
+    cache_images: bool,
+) -> Dict[str, Any]:
+    entries = {}
+    used_shards = []
+    for shard_path in _iter_shard_paths(shard_dir):
+        payload = load_tensor_cache(shard_path)
+        if not _is_compatible_hard_shard(payload, search_budget=search_budget, cache_images=cache_images):
+            continue
+        tensors = payload["tensors"]
+        metadata = payload.get("metadata", {})
+        indices = _payload_sample_indices(payload)
+        records = metadata.get("source_records", [])
+        used_shards.append(shard_path)
+        for row, sample_index in enumerate(indices):
+            if sample_index >= target_samples or sample_index in entries:
+                continue
+            feature_start = row * 2
+            feature_end = feature_start + 2
+            source = records[row] if row < len(records) else {"sample_index": int(sample_index)}
+            entries[int(sample_index)] = {
+                "hardness": tensors["hardness"][row : row + 1].detach().cpu(),
+                "enhancer_features": tensors["enhancer_features"][feature_start:feature_end].detach().cpu(),
+                "labels": tensors["labels"][feature_start:feature_end].detach().cpu(),
+                "base_scores": tensors["base_scores"][feature_start:feature_end].detach().cpu(),
+                "source_record": dict(source),
+            }
+
+    missing = sorted(set(range(target_samples)) - set(entries))
+    if missing:
+        preview = ", ".join(str(idx) for idx in missing[:8])
+        raise RuntimeError(f"cannot finalize hard sample cache; missing shard entries: {preview}")
+
+    ordered_indices = sorted(entries)
+    tensors = {
+        "sample_indices": torch.tensor(ordered_indices, dtype=torch.long),
+        "hardness": torch.cat([entries[idx]["hardness"] for idx in ordered_indices], dim=0).float(),
+        "enhancer_features": torch.cat(
+            [entries[idx]["enhancer_features"] for idx in ordered_indices], dim=0
+        ).float(),
+        "labels": torch.cat([entries[idx]["labels"] for idx in ordered_indices], dim=0).float(),
+        "base_scores": torch.cat([entries[idx]["base_scores"] for idx in ordered_indices], dim=0).float(),
+    }
+    metadata = {
+        "cache_version": 2,
+        "type": "hard_samples",
+        "complete": True,
+        "normal_stats": stats.__dict__,
+        "num_candidates": len(ordered_indices),
+        "source_records": [entries[idx]["source_record"] for idx in ordered_indices],
+        "search_budget": int(search_budget),
+        "cache_images": bool(cache_images),
+        "image_tensors_location": "shards" if cache_images else "not_saved",
+        "shard_dir": str(shard_dir),
+        "num_shards": len(used_shards),
+    }
+    save_tensor_cache(output_path, tensors, metadata)
+    return _summarize_hard_cache_payload({"tensors": tensors, "metadata": metadata}, output_path, reused=False)
+
+
+def _load_completed_sample_indices(
+    shard_dir: Path,
+    *,
+    target_samples: int,
+    search_budget: int,
+    cache_images: bool,
+) -> Set[int]:
+    completed: Set[int] = set()
+    for shard_path in _iter_shard_paths(shard_dir):
+        try:
+            payload = load_tensor_cache(shard_path)
+        except Exception as exc:
+            _warn(f"ignoring unreadable hard sample shard {shard_path}: {exc}")
+            continue
+        if not _is_compatible_hard_shard(payload, search_budget=search_budget, cache_images=cache_images):
+            continue
+        completed.update(idx for idx in _payload_sample_indices(payload) if idx < target_samples)
+    return completed
+
+
+def _iter_shard_paths(shard_dir: Path) -> List[Path]:
+    if not shard_dir.is_dir():
+        return []
+    return sorted(shard_dir.glob("shard-*.pt"))
+
+
+def _is_compatible_hard_shard(payload: Dict[str, Any], *, search_budget: int, cache_images: bool) -> bool:
+    metadata = payload.get("metadata", {})
+    if metadata.get("type") != "hard_sample_shard":
+        return False
+    if int(metadata.get("search_budget", -1)) != int(search_budget):
+        return False
+    if cache_images and not _as_bool(metadata.get("cache_images", False)):
+        return False
+    return True
+
+
+def _payload_sample_indices(payload: Dict[str, Any]) -> List[int]:
+    tensors = payload.get("tensors", {})
+    if "sample_indices" in tensors:
+        return [int(idx) for idx in tensors["sample_indices"].reshape(-1).tolist()]
+    return [int(idx) for idx in payload.get("metadata", {}).get("sample_indices", [])]
+
+
+def _try_summarize_hard_cache(
+    path: Path,
+    *,
+    target_samples: int,
+    search_budget: int,
+    cache_images: bool,
+) -> Optional[Dict[str, Any]]:
+    try:
+        payload = load_tensor_cache(path)
+        summary = _summarize_hard_cache_payload(payload, path, reused=True)
+        metadata = payload.get("metadata", {})
+        if summary["num_candidates"] != target_samples:
+            _warn(
+                "existing hard sample cache has "
+                f"{summary['num_candidates']} candidates but this run expects {target_samples}; regenerating"
+            )
+            return None
+        if int(metadata.get("search_budget", search_budget)) != int(search_budget):
+            _warn("existing hard sample cache uses a different SEARCH_BUDGET; regenerating")
+            return None
+        if cache_images and not _as_bool(metadata.get("cache_images", False)):
+            _warn("existing hard sample cache has no image shards but CACHE_IMAGES=true; regenerating")
+            return None
+        return summary
+    except Exception as exc:
+        _quarantine_unreadable_file(path, "hard sample cache", exc)
+        return None
+
+
+def _summarize_hard_cache_payload(payload: Dict[str, Any], path: Path, *, reused: bool) -> Dict[str, Any]:
+    tensors = payload.get("tensors", {})
+    metadata = payload.get("metadata", {})
+    if "enhancer_features" not in tensors or "labels" not in tensors or "base_scores" not in tensors:
+        raise ValueError("hard sample cache is missing enhancer training tensors")
+
+    hardness = tensors.get("hardness", torch.empty(0))
+    num_candidates = int(metadata.get("num_candidates", int(hardness.numel())))
+    normal_stats = metadata.get("normal_stats", {})
+    return {
+        "cache_path": str(path),
+        "reused": bool(reused),
+        "num_candidates": num_candidates,
+        "normal_score_mean": _dict_float(normal_stats, "mean"),
+        "normal_score_std": _dict_float(normal_stats, "std"),
+        "accepted_proxy": int((hardness.float() > 0).sum().item()) if hardness.numel() else 0,
+        "cache_images": _as_bool(metadata.get("cache_images", False)),
+        "image_tensors_location": metadata.get("image_tensors_location", "cache"),
+        "shard_dir": metadata.get("shard_dir"),
+        "num_shards": metadata.get("num_shards"),
+    }
+
+
+def _try_summarize_enhancer_checkpoint(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        payload = torch.load(path, map_location="cpu")
+        losses = payload.get("losses", [])
+        summary = {
+            "checkpoint_path": str(path),
+            "reused": True,
+            "input_dim": int(payload["input_dim"]),
+            "hidden_dim": int(payload.get("hidden_dim", 0)),
+            "epochs": int(payload.get("epochs", len(losses))),
+        }
+        if losses:
+            summary["final_loss"] = float(losses[-1])
+        return summary
+    except Exception as exc:
+        _quarantine_unreadable_file(path, "enhancer checkpoint", exc)
+        return None
+
+
+def _clear_hard_sample_artifacts(cache_path: Path) -> None:
+    cache_path.unlink(missing_ok=True)
+    shard_dir = _hard_sample_shard_dir(cache_path)
+    if shard_dir.exists():
+        shutil.rmtree(shard_dir)
+
+
+def _quarantine_unreadable_file(path: Path, label: str, exc: Exception) -> None:
+    if not path.exists():
+        return
+    target = path.with_name(f"{path.name}.corrupt")
+    counter = 1
+    while target.exists():
+        target = path.with_name(f"{path.name}.corrupt.{counter}")
+        counter += 1
+    try:
+        path.replace(target)
+        _warn(f"moved unreadable {label} to {target}: {exc}")
+    except OSError:
+        _warn(f"unreadable {label} at {path}: {exc}")
+
+
+def _dict_float(mapping: Any, key: str) -> Optional[float]:
+    if isinstance(mapping, dict) and mapping.get(key) is not None:
+        return float(mapping[key])
+    return None
+
+
+def _warn(message: str) -> None:
+    print(f"[llm-das-dinomaly] {message}", file=sys.stderr, flush=True)
 
 
 def _write_json(path: Path, payload: Dict[str, Any]) -> None:

@@ -20,8 +20,12 @@ data:
 hard_samples:
   search_budget: ${SEARCH_BUDGET:-4}
   max_samples: ${MAX_SAMPLES:-4}
+  shard_size: ${HARD_SAMPLE_SHARD_SIZE:-32}
+  cache_images: ${CACHE_IMAGES:-false}
+  regenerate: ${REGENERATE_HARD_SAMPLES:-false}
 
 enhancer:
   epochs: 1
   hidden_dim: 128
   lr: 0.001
+  retrain: ${RETRAIN_ENHANCER:-false}

@@ -78,10 +78,23 @@ Optional environment overrides:
 - `RUN_MODE`: defaults to `smoke`.
 - `MAX_SAMPLES`: defaults to `4`; use `all` for a full run.
 - `SEARCH_BUDGET`: defaults to `4`.
+- `HARD_SAMPLE_SHARD_SIZE`: defaults to `32`; hard samples are saved every
+  shard so interrupted runs can resume.
+- `CACHE_IMAGES`: defaults to `false`; set to `true` only when you need debug
+  image/mask/map tensors saved in per-shard files.
+- `REGENERATE_HARD_SAMPLES`: defaults to `false`; set to `true` to discard and
+  rebuild the hard-sample cache.
+- `RETRAIN_ENHANCER`: defaults to `false`; set to `true` to retrain even when
+  `enhancer.pt` already exists.
 - `PROGRESS`: defaults to `true`; set to `false` to disable terminal progress bars.
 
 The run writes `hard_samples.pt`, `enhancer.pt`, and `run_summary.json` under
-`OUTPUT_ROOT`.
+`OUTPUT_ROOT`. It also writes incremental shards under
+`OUTPUT_ROOT/hard_samples_shards/`. By default, `hard_samples.pt` is compact and
+contains only the tensors needed for enhancer training; existing valid caches
+and enhancer checkpoints are reused on the next run. If a previous run left an
+unreadable cache file, the runner moves it aside with a `.corrupt` suffix and
+rebuilds from any compatible shards that are present.
 
 ## Integration Notes
 
