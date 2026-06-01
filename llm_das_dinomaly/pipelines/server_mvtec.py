@@ -11,8 +11,15 @@ import torch
 
 from llm_das_dinomaly.data.mvtec import MVTEC_CLASSES
 from llm_das_dinomaly.data import MVTecGoodDataset, load_tensor_cache, save_tensor_cache, save_torch_payload
-from llm_das_dinomaly.enhancer import MapFeatureHead, ScoreNormalizer, build_enhancer_features, fuse_scores
+from llm_das_dinomaly.enhancer import (
+    MapFeatureHead,
+    ScoreNormalizer,
+    build_enhancer_features,
+    fuse_scores,
+    normalizer_from_metadata,
+)
 from llm_das_dinomaly.enhancer.heads import binary_enhancer_loss
+from llm_das_dinomaly.evaluation import append_metric_jsonl, evaluate_mvtec_detector, write_metric_json
 from llm_das_dinomaly.integrations import build_dinomaly_wrapper
 from llm_das_dinomaly.search import NormalScoreStats, SearchConfig, score_aware_search
 from llm_das_dinomaly.utils import ProgressBar, load_yaml_config, require_path, seed_everything
@@ -21,7 +28,7 @@ from llm_das_dinomaly.utils import ProgressBar, load_yaml_config, require_path, 
 def main(argv: Optional[List[str]] = None) -> None:
     parser = argparse.ArgumentParser(description="Run LLM-DAS Dinomaly MVTec server pipeline.")
     parser.add_argument("--config", required=True)
-    parser.add_argument("--stage", choices=["check", "hard-samples", "enhancer", "all"], default="all")
+    parser.add_argument("--stage", choices=["check", "hard-samples", "enhancer", "eval", "all"], default="all")
     args = parser.parse_args(argv)
 
     try:
@@ -38,6 +45,7 @@ def run_pipeline(cfg: Dict[str, Any], *, stage: str = "all") -> Dict[str, Any]:
     model_cfg = cfg.get("model", {})
     hard_cfg = cfg.get("hard_samples", {})
     enhancer_cfg = cfg.get("enhancer", {})
+    eval_cfg = cfg.get("evaluation", {})
 
     output_root = Path(runtime.get("output_root", "outputs/server_mvtec")).expanduser()
     output_root.mkdir(parents=True, exist_ok=True)
@@ -58,6 +66,18 @@ def run_pipeline(cfg: Dict[str, Any], *, stage: str = "all") -> Dict[str, Any]:
         limit_per_category = None
     batch_size = int(runtime.get("batch_size", 4))
     show_progress = _as_bool(runtime.get("progress", True))
+    eval_enabled = _as_bool(eval_cfg.get("enabled", True))
+    eval_batch_size = int(eval_cfg.get("batch_size", batch_size))
+    eval_resize_mask = _resolve_optional_int(
+        eval_cfg.get("resize_mask", 256),
+        none_values={"none", "0", "false"},
+    )
+    eval_limit_per_category = _resolve_optional_int(
+        eval_cfg.get("limit_per_category"),
+        none_values={"none", "all", "-1"},
+    )
+    eval_beta = float(eval_cfg.get("beta", 1.0))
+    metrics_dir = output_root / "metrics"
 
     dataset = MVTecGoodDataset(data_root, categories=categories, limit_per_category=limit_per_category)
     summary: Dict[str, Any] = {
@@ -102,6 +122,40 @@ def run_pipeline(cfg: Dict[str, Any], *, stage: str = "all") -> Dict[str, Any]:
     cache_images = _as_bool(hard_cfg.get("cache_images", False))
     hard_shard_size = int(hard_cfg.get("shard_size", 32))
 
+    if stage == "eval":
+        evaluation_summary: Dict[str, Any] = {}
+        evaluation_summary["baseline"] = _run_and_write_evaluation(
+            get_wrapper(),
+            data_root,
+            categories=categories,
+            batch_size=eval_batch_size,
+            device=device,
+            resize_mask=eval_resize_mask,
+            limit_per_category=eval_limit_per_category,
+            beta=eval_beta,
+            metrics_dir=metrics_dir,
+            name="eval_summary",
+        )
+        if enhancer_path.is_file():
+            enhancer_head, enhancer_payload = _load_enhancer_head(enhancer_path)
+            evaluation_summary["enhanced"] = _run_and_write_evaluation(
+                get_wrapper(),
+                data_root,
+                categories=categories,
+                batch_size=eval_batch_size,
+                device=device,
+                resize_mask=eval_resize_mask,
+                limit_per_category=eval_limit_per_category,
+                beta=eval_beta,
+                metrics_dir=metrics_dir,
+                name="eval_enhanced",
+                enhancer_head=enhancer_head,
+                fusion_calibration=enhancer_payload.get("fusion_calibration"),
+            )
+        summary["evaluation"] = evaluation_summary
+        _write_json(summary_path, summary)
+        return summary
+
     if stage in ("hard-samples", "all"):
         hard_summary = None
         if regenerate_hard:
@@ -135,7 +189,42 @@ def run_pipeline(cfg: Dict[str, Any], *, stage: str = "all") -> Dict[str, Any]:
         enhancer_summary = None
         if enhancer_path.is_file() and not retrain_enhancer:
             enhancer_summary = _try_summarize_enhancer_checkpoint(enhancer_path)
+        if eval_enabled:
+            summary.setdefault("evaluation", {})["baseline"] = _run_and_write_evaluation(
+                get_wrapper(),
+                data_root,
+                categories=categories,
+                batch_size=eval_batch_size,
+                device=device,
+                resize_mask=eval_resize_mask,
+                limit_per_category=eval_limit_per_category,
+                beta=eval_beta,
+                metrics_dir=metrics_dir,
+                name="baseline_eval",
+            )
         if enhancer_summary is None:
+            def eval_callback(*, head, epoch, loss, fusion_calibration):
+                record = {
+                    "epoch": int(epoch),
+                    "loss": float(loss),
+                    "metrics": _run_and_write_evaluation(
+                        get_wrapper(),
+                        data_root,
+                        categories=categories,
+                        batch_size=eval_batch_size,
+                        device=device,
+                        resize_mask=eval_resize_mask,
+                        limit_per_category=eval_limit_per_category,
+                        beta=eval_beta,
+                        metrics_dir=metrics_dir,
+                        name=f"enhancer_epoch_{int(epoch):04d}",
+                        enhancer_head=head,
+                        fusion_calibration=fusion_calibration,
+                    ),
+                }
+                append_metric_jsonl(metrics_dir / "enhancer_epochs.jsonl", record)
+                return record
+
             enhancer_summary = train_enhancer_from_cache(
                 hard_cache,
                 enhancer_path,
@@ -144,8 +233,25 @@ def run_pipeline(cfg: Dict[str, Any], *, stage: str = "all") -> Dict[str, Any]:
                 lr=float(enhancer_cfg.get("lr", 1e-3)),
                 seed=seed,
                 show_progress=show_progress,
+                eval_callback=eval_callback if eval_enabled else None,
             )
         summary["enhancer"] = enhancer_summary
+        if eval_enabled and enhancer_path.is_file():
+            enhancer_head, enhancer_payload = _load_enhancer_head(enhancer_path)
+            summary.setdefault("evaluation", {})["final_enhanced"] = _run_and_write_evaluation(
+                get_wrapper(),
+                data_root,
+                categories=categories,
+                batch_size=eval_batch_size,
+                device=device,
+                resize_mask=eval_resize_mask,
+                limit_per_category=eval_limit_per_category,
+                beta=eval_beta,
+                metrics_dir=metrics_dir,
+                name="final_enhanced_eval",
+                enhancer_head=enhancer_head,
+                fusion_calibration=enhancer_payload.get("fusion_calibration"),
+            )
 
     _write_json(summary_path, summary)
     return summary
@@ -685,6 +791,72 @@ def _try_summarize_enhancer_checkpoint(path: Path) -> Optional[Dict[str, Any]]:
         return None
 
 
+def _load_enhancer_head(path: Path) -> Tuple[MapFeatureHead, Dict[str, Any]]:
+    payload = torch.load(path, map_location="cpu")
+    if isinstance(payload, dict) and "state_dict" in payload:
+        state_dict = payload["state_dict"]
+        metadata = payload
+    elif isinstance(payload, dict):
+        state_dict = payload
+        metadata = {"state_dict": payload}
+    else:
+        raise ValueError(f"enhancer checkpoint has unsupported payload type: {type(payload)!r}")
+
+    if "input_dim" not in metadata:
+        raise ValueError(f"enhancer checkpoint is missing input_dim: {path}")
+    head = MapFeatureHead(
+        input_dim=int(metadata["input_dim"]),
+        hidden_dim=int(metadata.get("hidden_dim", 128)),
+    )
+    head.load_state_dict(state_dict)
+    head.eval()
+    return head, metadata
+
+
+def _run_and_write_evaluation(
+    wrapper,
+    data_root: Path,
+    *,
+    categories: Sequence[str],
+    batch_size: int,
+    device: str,
+    resize_mask: Optional[int],
+    limit_per_category: Optional[int],
+    beta: float,
+    metrics_dir: Path,
+    name: str,
+    enhancer_head: Optional[MapFeatureHead] = None,
+    fusion_calibration: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    base_normalizer = None
+    aux_normalizer = None
+    if enhancer_head is not None:
+        if not isinstance(fusion_calibration, dict) or not {"base", "aux"} <= set(fusion_calibration):
+            raise ValueError(
+                "enhanced evaluation requires fusion_calibration with both 'base' and 'aux' normalizers"
+            )
+        if "base" in fusion_calibration:
+            base_normalizer = normalizer_from_metadata(fusion_calibration["base"])
+        if "aux" in fusion_calibration:
+            aux_normalizer = normalizer_from_metadata(fusion_calibration["aux"])
+
+    payload = evaluate_mvtec_detector(
+        wrapper,
+        data_root,
+        categories=categories,
+        batch_size=batch_size,
+        device=device,
+        resize_mask=resize_mask,
+        enhancer_head=enhancer_head,
+        beta=beta,
+        base_normalizer=base_normalizer,
+        aux_normalizer=aux_normalizer,
+        limit_per_category=limit_per_category,
+    )
+    write_metric_json(metrics_dir / f"{name}.json", payload)
+    return payload
+
+
 def _fit_fusion_calibration(base_scores: torch.Tensor, aux_scores: torch.Tensor) -> Dict[str, Dict[str, float]]:
     base = ScoreNormalizer().fit(base_scores.reshape(-1))
     aux = ScoreNormalizer().fit(aux_scores.reshape(-1))
@@ -734,6 +906,14 @@ def _write_json(path: Path, payload: Dict[str, Any]) -> None:
 def _resolve_max_samples(value: Any, *, mode: str) -> int:
     if mode == "full" and (value is None or str(value).lower() in {"all", "none", "-1"}):
         return 10**12
+    return int(value)
+
+
+def _resolve_optional_int(value: Any, *, none_values: Set[str]) -> Optional[int]:
+    if value is None:
+        return None
+    if str(value).strip().lower() in none_values:
+        return None
     return int(value)
 
 
