@@ -3,6 +3,41 @@ set -euo pipefail
 
 CONFIG_PATH="${1:-configs/server_mvtec.yaml}"
 ENV_FILE="${2:-${SERVER_ENV_FILE:-}}"
+OVERRIDE_CANDIDATES=(
+  DATA_ROOT
+  CHECKPOINT_PATH
+  OUTPUT_ROOT
+  DINOMALY_ROOT
+  DEVICE
+  RUN_MODE
+  BATCH_SIZE
+  MVTEC_CATEGORY
+  MAX_SAMPLES
+  SEARCH_BUDGET
+  HARD_SAMPLE_SHARD_SIZE
+  CACHE_IMAGES
+  REGENERATE_HARD_SAMPLES
+  RETRAIN_ENHANCER
+  PROGRESS
+  EVAL_ENABLED
+  EVAL_BATCH_SIZE
+  EVAL_NUM_WORKERS
+  EVAL_RESIZE_MASK
+  EVAL_LIMIT_PER_CATEGORY
+  EVAL_PIXEL_METRICS
+  EVAL_PIXEL_AUPRO
+  EVAL_EPOCH_PIXEL_METRICS
+  EVAL_FUSION_BETA
+)
+OVERRIDE_NAMES=()
+OVERRIDE_VALUES=()
+
+for name in "${OVERRIDE_CANDIDATES[@]}"; do
+  if [[ -n "${!name+x}" ]]; then
+    OVERRIDE_NAMES+=("${name}")
+    OVERRIDE_VALUES+=("${!name}")
+  fi
+done
 
 if [[ -z "${ENV_FILE}" && -f "configs/server_paths.env" ]]; then
   ENV_FILE="configs/server_paths.env"
@@ -23,6 +58,10 @@ if [[ -n "${ENV_FILE}" ]]; then
   source "${ENV_FILE}"
   set +a
 fi
+
+for idx in "${!OVERRIDE_NAMES[@]}"; do
+  export "${OVERRIDE_NAMES[$idx]}=${OVERRIDE_VALUES[$idx]}"
+done
 
 RUN_MODE="${RUN_MODE:-smoke}"
 export RUN_MODE

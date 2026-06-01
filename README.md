@@ -64,7 +64,9 @@ bash scripts/run_server_mvtec.sh configs/server_mvtec.yaml configs/server_paths.
 ```
 
 If `configs/server_paths.env` exists, `scripts/run_server_mvtec.sh` also loads
-it automatically, so this shorter command works after the first edit:
+it automatically, so this shorter command works after the first edit. Inline
+environment overrides on the shell command take precedence over values in the
+env file, which is useful for quick smoke/eval runs:
 
 ```bash
 bash scripts/run_server_mvtec.sh
@@ -76,6 +78,8 @@ Optional environment overrides:
 - `DEVICE`: defaults to `cuda`.
 - `MVTEC_CATEGORY`: defaults to `bottle` in smoke mode.
 - `RUN_MODE`: defaults to `smoke`.
+- `BATCH_SIZE`: defaults to `16`, matching the official Dinomaly runner's
+  batch size for the main server pipeline.
 - `MAX_SAMPLES`: defaults to `4`; use `all` for a full run.
 - `SEARCH_BUDGET`: defaults to `4`.
 - `HARD_SAMPLE_SHARD_SIZE`: defaults to `32`; hard samples are saved every
@@ -89,6 +93,16 @@ Optional environment overrides:
 - `PROGRESS`: defaults to `true`; set to `false` to disable terminal progress bars.
 - `EVAL_ENABLED`: defaults to `true`; set to `false` for train-only smoke runs
   when the data root does not include MVTec `test/` and `ground_truth/`.
+- `EVAL_BATCH_SIZE`: defaults to `16`, matching the official Dinomaly eval
+  batch size.
+- `EVAL_NUM_WORKERS`: defaults to `4`, matching the official Dinomaly test
+  dataloader worker count.
+- `EVAL_PIXEL_METRICS`: defaults to `true`; set to `false` for image-only
+  fast checks.
+- `EVAL_PIXEL_AUPRO`: defaults to `false`; set to `true` for full parity with
+  Dinomaly's reported pixel AUPRO.
+- `EVAL_EPOCH_PIXEL_METRICS`: defaults to `false` so per-epoch enhancer
+  evaluations stay image-level and fast.
 
 The run writes `hard_samples.pt`, `enhancer.pt`, `run_summary.json`, and
 evaluation metrics under `OUTPUT_ROOT`. Hard sample shards are saved under
@@ -103,9 +117,35 @@ Metrics are written under `OUTPUT_ROOT/metrics/`, including
 `baseline_eval.json`, `enhancer_epochs.jsonl`, per-epoch files such as
 `enhancer_epoch_0001.json`, and `final_enhanced_eval.json`. Eval-only runs write
 `eval_summary.json` and, when an enhancer checkpoint exists,
-`eval_enhanced.json`:
+`eval_enhanced.json`. During long evaluations, category-level partial results
+are also written to matching `*.progress.json` files so server logs can be
+tailed without guessing whether eval is still moving:
 
 ```bash
+python -m llm_das_dinomaly.pipelines.server_mvtec --config configs/server_mvtec.yaml --stage eval
+```
+
+Fast smoke evaluation:
+
+```bash
+RUN_MODE=smoke EVAL_LIMIT_PER_CATEGORY=8 EVAL_BATCH_SIZE=16 EVAL_PIXEL_AUPRO=false \
+bash scripts/run_server_mvtec.sh configs/server_mvtec.yaml configs/server_paths.env
+```
+
+Fast eval-only run after `enhancer.pt` exists:
+
+```bash
+set -a
+source configs/server_paths.env
+set +a
+RUN_MODE=full EVAL_BATCH_SIZE=16 EVAL_PIXEL_AUPRO=false \
+python -m llm_das_dinomaly.pipelines.server_mvtec --config configs/server_mvtec.yaml --stage eval
+```
+
+Full parity with Dinomaly's reported pixel AUPRO:
+
+```bash
+RUN_MODE=full EVAL_BATCH_SIZE=16 EVAL_RESIZE_MASK=256 EVAL_PIXEL_METRICS=true EVAL_PIXEL_AUPRO=true \
 python -m llm_das_dinomaly.pipelines.server_mvtec --config configs/server_mvtec.yaml --stage eval
 ```
 
@@ -113,7 +153,9 @@ The enhancer changes image-level scores only. Pixel metrics continue to come
 from the base Dinomaly anomaly map and are labeled `base_dinomaly_map` in
 enhanced summaries. Because `EVAL_ENABLED` defaults to `true`, the server data
 root must include MVTec `test/` and `ground_truth/`; set `EVAL_ENABLED=false`
-for train-only smoke runs.
+for train-only smoke runs. Per-epoch enhancer evaluation is image-level by
+default; set `EVAL_EPOCH_PIXEL_METRICS=true` only when the extra pixel-metric
+cost is intentional.
 
 ## Integration Notes
 

@@ -16,17 +16,21 @@ class ProgressBar:
         enabled: bool = True,
         stream: Optional[TextIO] = None,
         width: int = 28,
+        min_interval_seconds: float = 5.0,
     ) -> None:
         self.total = max(1, int(total))
         self.label = label
         self.enabled = enabled
         self.stream = stream or sys.stderr
         self.width = width
+        self.min_interval_seconds = max(0.0, float(min_interval_seconds))
         self.current = 0
         self.started_at = time.time()
+        self._last_render_at = 0.0
         self._last_len = 0
+        self._is_tty = _stream_is_tty(self.stream)
         if self.enabled:
-            self.render()
+            self.render(force=True)
 
     def update(self, step: int = 1, *, suffix: str = "") -> None:
         self.current = min(self.total, self.current + step)
@@ -36,11 +40,20 @@ class ProgressBar:
     def close(self, *, suffix: str = "done") -> None:
         self.current = self.total
         if self.enabled:
-            self.render(suffix=suffix)
-            self.stream.write("\n")
+            self.render(suffix=suffix, force=True)
+            if self._is_tty:
+                self.stream.write("\n")
             self.stream.flush()
 
-    def render(self, *, suffix: str = "") -> None:
+    def render(self, *, suffix: str = "", force: bool = False) -> None:
+        now = time.time()
+        if (
+            not self._is_tty
+            and not force
+            and self.current < self.total
+            and now - self._last_render_at < self.min_interval_seconds
+        ):
+            return
         elapsed = max(1e-6, time.time() - self.started_at)
         ratio = self.current / self.total
         filled = int(self.width * ratio)
@@ -53,10 +66,14 @@ class ProgressBar:
         )
         if suffix:
             message += f" {suffix}"
-        padding = " " * max(0, self._last_len - len(message))
-        self.stream.write("\r" + message + padding)
+        if self._is_tty:
+            padding = " " * max(0, self._last_len - len(message))
+            self.stream.write("\r" + message + padding)
+            self._last_len = len(message)
+        else:
+            self.stream.write(message + "\n")
         self.stream.flush()
-        self._last_len = len(message)
+        self._last_render_at = now
 
 
 def _fmt_time(seconds: float) -> str:
@@ -68,3 +85,8 @@ def _fmt_time(seconds: float) -> str:
     if minutes:
         return f"{minutes:d}m{sec:02d}s"
     return f"{sec:d}s"
+
+
+def _stream_is_tty(stream: TextIO) -> bool:
+    isatty = getattr(stream, "isatty", None)
+    return bool(isatty()) if callable(isatty) else False

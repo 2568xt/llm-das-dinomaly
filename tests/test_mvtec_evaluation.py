@@ -18,6 +18,16 @@ class EvalDummyDinomaly(nn.Module):
         return [pooled, pooled * 0.5], [pooled.roll(shifts=1, dims=-1), pooled * 0.25]
 
 
+class CountingEvalDinomaly(EvalDummyDinomaly):
+    def __init__(self):
+        super().__init__()
+        self.forward_calls = 0
+
+    def forward(self, x):
+        self.forward_calls += 1
+        return super().forward(x)
+
+
 class ModeTrackingDinomaly(nn.Module):
     def __init__(self):
         super().__init__()
@@ -41,22 +51,9 @@ class TrackingEnhancer(nn.Module):
         return x[:, 0]
 
 
-class SentinelScoreWrapper(DinomalyWrapper):
-    def __init__(self):
-        super().__init__(
-            EvalDummyDinomaly(),
-            DinomalyConfig(image_size=32, crop_size=28, patch_size=7, gaussian_kernel=3, resize_mask=16),
-        )
-        self.predict_score_calls = 0
-
-    def predict_map(self, x, *, resize_to=None, smooth=True):
-        size = x.shape[-1] if resize_to is None else resize_to
-        values = x.mean(dim=(1, 2, 3), keepdim=True)
-        return values.expand(-1, 1, size, size).contiguous()
-
-    def predict_score(self, x, *, topk_ratio=None, resize_to=None):
-        self.predict_score_calls += 1
-        return -x.mean(dim=(1, 2, 3))
+class ExtractFailWrapper(DinomalyWrapper):
+    def extract_features(self, *args, **kwargs):
+        raise AssertionError("evaluation should reuse encoder groups from the map/score forward")
 
 
 def test_evaluate_mvtec_detector_writes_baseline_metrics(tmp_path):
@@ -90,9 +87,13 @@ def test_evaluate_mvtec_detector_writes_baseline_metrics(tmp_path):
     assert summary["mean"]["baseline"]["num_categories"] == 1
 
 
-def test_evaluate_mvtec_detector_uses_predict_score_for_image_metrics(tmp_path):
+def test_evaluate_mvtec_detector_scores_from_single_forward_per_batch(tmp_path):
     data_root = _fake_mvtec_test(tmp_path / "mvtec")
-    wrapper = SentinelScoreWrapper()
+    model = CountingEvalDinomaly()
+    wrapper = DinomalyWrapper(
+        model,
+        DinomalyConfig(image_size=32, crop_size=28, patch_size=7, gaussian_kernel=3, resize_mask=16),
+    )
 
     summary = evaluate_mvtec_detector(
         wrapper,
@@ -103,8 +104,32 @@ def test_evaluate_mvtec_detector_uses_predict_score_for_image_metrics(tmp_path):
         resize_mask=16,
     )
 
-    assert wrapper.predict_score_calls == 1
-    assert summary["categories"]["bottle"]["baseline"]["image_auroc"] == 0.0
+    assert model.forward_calls == 1
+    assert summary["categories"]["bottle"]["baseline"]["image_auroc"] is not None
+
+
+def test_evaluate_mvtec_detector_skips_aupro_when_disabled(tmp_path, monkeypatch):
+    data_root = _fake_mvtec_test(tmp_path / "mvtec")
+    wrapper = DinomalyWrapper(
+        EvalDummyDinomaly(),
+        DinomalyConfig(image_size=32, crop_size=28, patch_size=7, gaussian_kernel=3, resize_mask=16),
+    )
+
+    def fail_pixel_aupro(*args, **kwargs):
+        raise AssertionError("AUPRO should be optional")
+
+    monkeypatch.setattr("llm_das_dinomaly.evaluation.mvtec.pixel_aupro", fail_pixel_aupro)
+    summary = evaluate_mvtec_detector(
+        wrapper,
+        data_root,
+        categories=["bottle"],
+        batch_size=2,
+        device="cpu",
+        resize_mask=16,
+        pixel_aupro_enabled=False,
+    )
+
+    assert summary["categories"]["bottle"]["baseline"]["pixel_aupro"] is None
 
 
 def test_evaluate_mvtec_detector_restores_wrapper_module_modes(tmp_path):
@@ -135,8 +160,9 @@ def test_evaluate_mvtec_detector_restores_wrapper_module_modes(tmp_path):
 
 def test_evaluate_mvtec_detector_restores_enhancer_module_modes(tmp_path):
     data_root = _fake_mvtec_test(tmp_path / "mvtec")
-    wrapper = DinomalyWrapper(
-        EvalDummyDinomaly(),
+    model = CountingEvalDinomaly()
+    wrapper = ExtractFailWrapper(
+        model,
         DinomalyConfig(image_size=32, crop_size=28, patch_size=7, gaussian_kernel=3, resize_mask=16),
     )
     enhancer = TrackingEnhancer()
@@ -155,6 +181,7 @@ def test_evaluate_mvtec_detector_restores_enhancer_module_modes(tmp_path):
 
     enhanced = summary["categories"]["bottle"]["enhanced"]
     assert enhanced["pixel_source"] == "base_dinomaly_map"
+    assert model.forward_calls == 1
     assert enhancer.forward_modes
     assert all(mode == (False, False) for mode in enhancer.forward_modes)
     assert enhancer.training is True

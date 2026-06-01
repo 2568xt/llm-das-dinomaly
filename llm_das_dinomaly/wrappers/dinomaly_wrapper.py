@@ -129,6 +129,28 @@ class DinomalyWrapper(nn.Module):
         return out
 
     @torch.no_grad()
+    def predict_map_score_features(
+        self,
+        x: Tensor,
+        *,
+        resize_to: Optional[int] = None,
+        smooth: bool = True,
+        topk_ratio: Optional[float] = None,
+        return_encoder: bool = False,
+    ) -> Dict[str, Any]:
+        """Run one model forward and derive eval artifacts from the same map."""
+
+        out = self.forward_features(x)
+        anomaly_map = self._anomaly_map_from_features(out, x=x, resize_to=resize_to, smooth=smooth)
+        result: Dict[str, Any] = {
+            "anomaly_map": anomaly_map,
+            "score": self._score_from_anomaly_map(anomaly_map, topk_ratio=topk_ratio),
+        }
+        if return_encoder:
+            result["encoder_groups"] = out["encoder_groups"]
+        return result
+
+    @torch.no_grad()
     def predict_map(
         self,
         x: Tensor,
@@ -136,20 +158,7 @@ class DinomalyWrapper(nn.Module):
         resize_to: Optional[int] = None,
         smooth: bool = True,
     ) -> Tensor:
-        out = self.forward_features(x)
-        target_size = x.shape[-1] if resize_to is None else resize_to
-        anomaly_map = self._cosine_anomaly_map(
-            out["encoder_groups"],
-            out["decoder_groups"],
-            out_size=target_size,
-        )
-        if smooth:
-            anomaly_map = self._gaussian_blur(
-                anomaly_map,
-                kernel_size=self.cfg.gaussian_kernel,
-                sigma=self.cfg.gaussian_sigma,
-            )
-        return anomaly_map
+        return self.predict_map_score_features(x, resize_to=resize_to, smooth=smooth)["anomaly_map"]
 
     @torch.no_grad()
     def predict_score(
@@ -159,11 +168,7 @@ class DinomalyWrapper(nn.Module):
         topk_ratio: Optional[float] = None,
         resize_to: Optional[int] = None,
     ) -> Tensor:
-        anomaly_map = self.predict_map(x, resize_to=resize_to, smooth=True)
-        flat = anomaly_map.flatten(1)
-        ratio = self.cfg.topk_ratio if topk_ratio is None else topk_ratio
-        k = max(1, min(flat.shape[1], int(flat.shape[1] * ratio)))
-        return torch.topk(flat, k=k, dim=1).values.mean(dim=1)
+        return self.predict_map_score_features(x, resize_to=resize_to, topk_ratio=topk_ratio)["score"]
 
     @torch.no_grad()
     def score_candidates(
@@ -203,6 +208,34 @@ class DinomalyWrapper(nn.Module):
             "mean": self.mean.flatten().detach().cpu().tolist(),
             "std": self.std.flatten().detach().cpu().tolist(),
         }
+
+    def _anomaly_map_from_features(
+        self,
+        features: Dict[str, List[Tensor]],
+        *,
+        x: Tensor,
+        resize_to: Optional[int],
+        smooth: bool,
+    ) -> Tensor:
+        target_size = x.shape[-1] if resize_to is None else resize_to
+        anomaly_map = self._cosine_anomaly_map(
+            features["encoder_groups"],
+            features["decoder_groups"],
+            out_size=target_size,
+        )
+        if smooth:
+            anomaly_map = self._gaussian_blur(
+                anomaly_map,
+                kernel_size=self.cfg.gaussian_kernel,
+                sigma=self.cfg.gaussian_sigma,
+            )
+        return anomaly_map
+
+    def _score_from_anomaly_map(self, anomaly_map: Tensor, *, topk_ratio: Optional[float] = None) -> Tensor:
+        flat = anomaly_map.flatten(1)
+        ratio = self.cfg.topk_ratio if topk_ratio is None else topk_ratio
+        k = max(1, min(flat.shape[1], int(flat.shape[1] * ratio)))
+        return torch.topk(flat, k=k, dim=1).values.mean(dim=1)
 
     @staticmethod
     def _center_crop(x: Tensor, crop_size: int) -> Tensor:

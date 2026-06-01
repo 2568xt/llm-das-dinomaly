@@ -2,7 +2,7 @@ runtime:
   mode: ${RUN_MODE:-smoke}
   device: ${DEVICE:-cuda}
   seed: 7
-  batch_size: 2
+  batch_size: ${BATCH_SIZE:-16}
   output_root: ${OUTPUT_ROOT:-outputs/server_mvtec}
   progress: ${PROGRESS:-true}
 
@@ -32,7 +32,11 @@ enhancer:
 
 evaluation:
   enabled: ${EVAL_ENABLED:-true}
-  batch_size: ${EVAL_BATCH_SIZE:-2}
+  batch_size: ${EVAL_BATCH_SIZE:-16}
+  num_workers: ${EVAL_NUM_WORKERS:-4}
   resize_mask: ${EVAL_RESIZE_MASK:-256}
   limit_per_category: ${EVAL_LIMIT_PER_CATEGORY:-all}
+  pixel_metrics: ${EVAL_PIXEL_METRICS:-true}
+  pixel_aupro: ${EVAL_PIXEL_AUPRO:-false}
+  epoch_pixel_metrics: ${EVAL_EPOCH_PIXEL_METRICS:-false}
   beta: ${EVAL_FUSION_BETA:-1.0}

@@ -64,10 +64,11 @@ def run_pipeline(cfg: Dict[str, Any], *, stage: str = "all") -> Dict[str, Any]:
     if mode == "full":
         categories = list(MVTEC_CLASSES) if categories == ["bottle"] else categories
         limit_per_category = None
-    batch_size = int(runtime.get("batch_size", 4))
+    batch_size = int(runtime.get("batch_size", 16))
     show_progress = _as_bool(runtime.get("progress", True))
     eval_enabled = _as_bool(eval_cfg.get("enabled", True))
     eval_batch_size = int(eval_cfg.get("batch_size", batch_size))
+    eval_num_workers = int(eval_cfg.get("num_workers", 0))
     eval_resize_mask = _resolve_optional_int(
         eval_cfg.get("resize_mask", 256),
         none_values={"none", "0", "false"},
@@ -77,6 +78,9 @@ def run_pipeline(cfg: Dict[str, Any], *, stage: str = "all") -> Dict[str, Any]:
         none_values={"none", "all", "-1"},
     )
     eval_beta = float(eval_cfg.get("beta", 1.0))
+    eval_pixel_metrics = _as_bool(eval_cfg.get("pixel_metrics", True))
+    eval_pixel_aupro = _as_bool(eval_cfg.get("pixel_aupro", False))
+    eval_epoch_pixel_metrics = _as_bool(eval_cfg.get("epoch_pixel_metrics", False))
     metrics_dir = output_root / "metrics"
 
     dataset = MVTecGoodDataset(data_root, categories=categories, limit_per_category=limit_per_category)
@@ -135,6 +139,10 @@ def run_pipeline(cfg: Dict[str, Any], *, stage: str = "all") -> Dict[str, Any]:
             beta=eval_beta,
             metrics_dir=metrics_dir,
             name="eval_summary",
+            num_workers=eval_num_workers,
+            pixel_metrics=eval_pixel_metrics,
+            pixel_aupro=eval_pixel_aupro,
+            show_progress=show_progress,
         )
         if enhancer_path.is_file():
             enhancer_head, enhancer_payload = _load_enhancer_head(enhancer_path)
@@ -151,6 +159,10 @@ def run_pipeline(cfg: Dict[str, Any], *, stage: str = "all") -> Dict[str, Any]:
                 name="eval_enhanced",
                 enhancer_head=enhancer_head,
                 fusion_calibration=enhancer_payload.get("fusion_calibration"),
+                num_workers=eval_num_workers,
+                pixel_metrics=eval_pixel_metrics,
+                pixel_aupro=eval_pixel_aupro,
+                show_progress=show_progress,
             )
         summary["evaluation"] = evaluation_summary
         _write_json(summary_path, summary)
@@ -201,6 +213,10 @@ def run_pipeline(cfg: Dict[str, Any], *, stage: str = "all") -> Dict[str, Any]:
                 beta=eval_beta,
                 metrics_dir=metrics_dir,
                 name="baseline_eval",
+                num_workers=eval_num_workers,
+                pixel_metrics=eval_pixel_metrics,
+                pixel_aupro=eval_pixel_aupro,
+                show_progress=show_progress,
             )
         if enhancer_summary is None:
             if eval_enabled:
@@ -225,6 +241,10 @@ def run_pipeline(cfg: Dict[str, Any], *, stage: str = "all") -> Dict[str, Any]:
                         name=f"enhancer_epoch_{int(epoch):04d}",
                         enhancer_head=head,
                         fusion_calibration=fusion_calibration,
+                        num_workers=eval_num_workers,
+                        pixel_metrics=eval_epoch_pixel_metrics,
+                        pixel_aupro=False,
+                        show_progress=show_progress,
                     ),
                 }
                 append_metric_jsonl(metrics_dir / "enhancer_epochs.jsonl", record)
@@ -256,6 +276,10 @@ def run_pipeline(cfg: Dict[str, Any], *, stage: str = "all") -> Dict[str, Any]:
                 name="final_enhanced_eval",
                 enhancer_head=enhancer_head,
                 fusion_calibration=enhancer_payload.get("fusion_calibration"),
+                num_workers=eval_num_workers,
+                pixel_metrics=eval_pixel_metrics,
+                pixel_aupro=eval_pixel_aupro,
+                show_progress=show_progress,
             )
 
     _write_json(summary_path, summary)
@@ -832,6 +856,10 @@ def _run_and_write_evaluation(
     name: str,
     enhancer_head: Optional[MapFeatureHead] = None,
     fusion_calibration: Optional[Dict[str, Any]] = None,
+    num_workers: int = 0,
+    pixel_metrics: bool = True,
+    pixel_aupro: bool = False,
+    show_progress: bool = True,
 ) -> Dict[str, Any]:
     base_normalizer = None
     aux_normalizer = None
@@ -857,6 +885,12 @@ def _run_and_write_evaluation(
         base_normalizer=base_normalizer,
         aux_normalizer=aux_normalizer,
         limit_per_category=limit_per_category,
+        num_workers=num_workers,
+        pixel_metrics=pixel_metrics,
+        pixel_aupro_enabled=pixel_aupro,
+        show_progress=show_progress,
+        progress_label=name,
+        progress_path=metrics_dir / f"{name}.progress.json",
     )
     write_metric_json(metrics_dir / f"{name}.json", payload)
     return payload
