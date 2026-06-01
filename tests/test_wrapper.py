@@ -16,6 +16,16 @@ class DummyDinomaly(nn.Module):
         return enc, dec
 
 
+class CountingDinomaly(DummyDinomaly):
+    def __init__(self):
+        super().__init__()
+        self.forward_calls = 0
+
+    def forward(self, x):
+        self.forward_calls += 1
+        return super().forward(x)
+
+
 def test_preprocess_crop_and_normalize_shape():
     wrapper = DinomalyWrapper(DummyDinomaly(), DinomalyConfig(image_size=32, crop_size=28, patch_size=7))
     x = torch.rand(2, 3, 20, 24)
@@ -32,8 +42,9 @@ def test_preprocess_pil_list_with_mixed_sizes():
 
 
 def test_predict_map_score_and_features():
+    model = CountingDinomaly()
     wrapper = DinomalyWrapper(
-        DummyDinomaly(),
+        model,
         DinomalyConfig(image_size=32, crop_size=28, patch_size=7, gaussian_kernel=3),
     )
     x = torch.rand(2, 3, 28, 28)
@@ -46,6 +57,13 @@ def test_predict_map_score_and_features():
     assert anomaly_map.shape == (2, 1, 28, 28)
     assert score.shape == (2,)
     assert (score >= 0).all()
+
+    model.forward_calls = 0
+    prediction = wrapper.predict_map_score_features(x, return_encoder=True)
+    assert model.forward_calls == 1
+    assert prediction["anomaly_map"].shape == (2, 1, 28, 28)
+    assert prediction["score"].shape == (2,)
+    assert len(prediction["encoder_groups"]) == 2
 
 
 def test_score_candidates_with_mask_overlap():

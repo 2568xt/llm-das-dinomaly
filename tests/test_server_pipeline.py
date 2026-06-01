@@ -230,13 +230,22 @@ def test_server_pipeline_eval_stage_writes_metrics(tmp_path, monkeypatch):
             "runtime": {"output_root": str(tmp_path / "out"), "device": "cpu", "progress": False},
             "data": {"root": str(data_root), "categories": ["bottle"], "limit_per_category": 1},
             "model": {"dinomaly_root": str(dinomaly_root), "checkpoint_path": str(checkpoint)},
-            "evaluation": {"batch_size": 1, "resize_mask": 16, "limit_per_category": "all"},
+            "evaluation": {
+                "batch_size": 1,
+                "num_workers": 0,
+                "resize_mask": 16,
+                "limit_per_category": "all",
+                "pixel_metrics": False,
+                "pixel_aupro": False,
+            },
         },
         stage="eval",
     )
 
     assert summary["evaluation"]["baseline"]["mean"]["baseline"]["num_categories"] == 1
+    assert summary["evaluation"]["baseline"]["categories"]["bottle"]["baseline"]["pixel_auroc"] is None
     assert (tmp_path / "out" / "metrics" / "eval_summary.json").exists()
+    assert (tmp_path / "out" / "metrics" / "eval_summary.progress.json").exists()
 
 
 def test_server_pipeline_enhanced_eval_requires_saved_calibration(tmp_path, monkeypatch):
@@ -356,7 +365,16 @@ def test_server_pipeline_all_stage_writes_training_evaluation_metrics(tmp_path, 
     metrics_dir = output_root / "metrics"
     assert summary["evaluation"]["baseline"]["mean"]["baseline"]["num_categories"] == 1
     assert summary["evaluation"]["final_enhanced"]["mean"]["enhanced"]["num_categories"] == 1
+    assert (
+        summary["enhancer"]["epoch_evaluations"][0]["metrics"]["categories"]["bottle"]["baseline"]["pixel_auroc"]
+        is None
+    )
+    assert (
+        summary["evaluation"]["final_enhanced"]["categories"]["bottle"]["baseline"]["pixel_auroc"]
+        is not None
+    )
     assert (metrics_dir / "baseline_eval.json").exists()
+    assert (metrics_dir / "baseline_eval.progress.json").exists()
     assert (metrics_dir / "enhancer_epoch_0001.json").exists()
     assert (metrics_dir / "enhancer_epochs.jsonl").exists()
     epoch_records = [

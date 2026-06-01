@@ -32,4 +32,19 @@ Keep `OUTPUT_ROOT/metrics/baseline_eval.json`,
 `OUTPUT_ROOT/metrics/final_enhanced_eval.json` with the server logs. The JSONL
 file records per-epoch enhancer evaluation and proves that the enhanced
 image-level score was evaluated against the original MVTec test split during
-training.
+training. Per-epoch evaluation is image-level by default so training remains
+fast; final evaluation keeps image metrics and pixel AUROC/AP/F1 enabled.
+
+Use the fast default while iterating:
+
+```bash
+RUN_MODE=smoke EVAL_LIMIT_PER_CATEGORY=8 EVAL_BATCH_SIZE=16 EVAL_PIXEL_AUPRO=false \
+bash scripts/run_server_mvtec.sh configs/server_mvtec.yaml configs/server_paths.env
+```
+
+Use full Dinomaly-style pixel AUPRO only for final parity reports:
+
+```bash
+RUN_MODE=full EVAL_BATCH_SIZE=16 EVAL_RESIZE_MASK=256 EVAL_PIXEL_METRICS=true EVAL_PIXEL_AUPRO=true \
+python -m llm_das_dinomaly.pipelines.server_mvtec --config configs/server_mvtec.yaml --stage eval
+```

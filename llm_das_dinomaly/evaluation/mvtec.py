@@ -8,11 +8,13 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch.utils.data import DataLoader
 
 from llm_das_dinomaly.data import MVTecTestDataset
 from llm_das_dinomaly.enhancer import build_enhancer_features, fuse_scores
 from llm_das_dinomaly.enhancer.fusion import ScoreNormalizer
 from llm_das_dinomaly.evaluation.metrics import metric_bundle, pixel_aupro
+from llm_das_dinomaly.utils import ProgressBar
 
 
 def evaluate_mvtec_detector(
@@ -28,6 +30,12 @@ def evaluate_mvtec_detector(
     base_normalizer: Optional[ScoreNormalizer] = None,
     aux_normalizer: Optional[ScoreNormalizer] = None,
     limit_per_category: Optional[int] = None,
+    num_workers: int = 0,
+    pixel_metrics: bool = True,
+    pixel_aupro_enabled: bool = False,
+    show_progress: bool = True,
+    progress_label: str = "mvtec eval",
+    progress_path: Optional[Path] = None,
 ) -> Dict[str, Any]:
     category_summaries: Dict[str, Any] = {}
     for category in categories:
@@ -46,7 +54,23 @@ def evaluate_mvtec_detector(
             beta=beta,
             base_normalizer=base_normalizer,
             aux_normalizer=aux_normalizer,
+            category=category,
+            num_workers=num_workers,
+            pixel_metrics=pixel_metrics,
+            pixel_aupro_enabled=pixel_aupro_enabled,
+            show_progress=show_progress,
+            progress_label=progress_label,
         )
+        if progress_path is not None:
+            write_metric_json(
+                progress_path,
+                {
+                    "categories": category_summaries,
+                    "mean": _mean_category_metrics(category_summaries),
+                    "completed_categories": list(category_summaries),
+                    "total_categories": len(categories),
+                },
+            )
 
     return {
         "categories": category_summaries,
@@ -78,8 +102,21 @@ def _evaluate_category(
     beta: float,
     base_normalizer: Optional[ScoreNormalizer],
     aux_normalizer: Optional[ScoreNormalizer],
+    category: str,
+    num_workers: int,
+    pixel_metrics: bool,
+    pixel_aupro_enabled: bool,
+    show_progress: bool,
+    progress_label: str,
 ) -> Dict[str, Any]:
     wrapper.to(device)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=max(1, int(batch_size)),
+        shuffle=False,
+        num_workers=max(0, int(num_workers)),
+        collate_fn=_collate_batch,
+    )
 
     labels: List[torch.Tensor] = []
     base_scores: List[torch.Tensor] = []
@@ -92,58 +129,85 @@ def _evaluate_category(
     enhancer_context = (
         _preserve_training_state(enhancer_head) if enhancer_head is not None else nullcontext()
     )
+    progress = ProgressBar(
+        len(dataloader),
+        label=f"{progress_label} {category}",
+        enabled=show_progress,
+    )
+    seen = 0
     with _preserve_training_state(wrapper), enhancer_context:
         with torch.no_grad():
-            for start in range(0, len(dataset), batch_size):
-                images, masks, metas = _load_batch(dataset, start, batch_size)
+            for images, masks, metas in dataloader:
                 x = wrapper.preprocess(images).to(device)
-                anomaly_map = wrapper.predict_map(x, resize_to=resize_mask)
-                score = wrapper.predict_score(x)
+                prediction = wrapper.predict_map_score_features(
+                    x,
+                    resize_to=resize_mask,
+                    return_encoder=enhancer_head is not None,
+                )
+                anomaly_map = prediction["anomaly_map"]
+                score = prediction["score"]
 
                 batch_labels = torch.tensor([int(meta["label"]) for meta in metas], dtype=torch.long)
                 labels.append(batch_labels)
                 base_scores.append(score.detach().cpu())
 
-                mask_tensor = _mask_batch_to_tensor(masks, anomaly_map.shape[-2:]).cpu()
                 anomaly_cpu = anomaly_map.detach().cpu()
-                pixel_labels.append(mask_tensor[:, 0].reshape(-1).long())
-                pixel_scores.append(anomaly_cpu[:, 0].reshape(-1))
-                pixel_label_images.extend(mask_tensor[:, 0].numpy().astype(np.uint8))
-                pixel_score_images.extend(anomaly_cpu[:, 0].numpy())
+                if pixel_metrics:
+                    mask_tensor = _mask_batch_to_tensor(masks, anomaly_map.shape[-2:]).cpu()
+                    pixel_labels.append(mask_tensor[:, 0].reshape(-1).long())
+                    pixel_scores.append(anomaly_cpu[:, 0].reshape(-1))
+                    if pixel_aupro_enabled:
+                        pixel_label_images.extend(mask_tensor[:, 0].numpy().astype(np.uint8))
+                        pixel_score_images.extend(anomaly_cpu[:, 0].numpy())
 
                 if enhancer_head is not None:
-                    encoder_groups = wrapper.extract_features(x, which="encoder")
                     features = build_enhancer_features(
                         score.detach().cpu(),
                         anomaly_cpu,
-                        encoder_groups=[feat.detach().cpu() for feat in encoder_groups],
+                        encoder_groups=[feat.detach().cpu() for feat in prediction["encoder_groups"]],
                     )
                     features = features.to(_module_device(enhancer_head))
                     aux = torch.sigmoid(enhancer_head(features)).detach().cpu().reshape(-1)
                     aux_scores.append(aux)
+                seen += len(metas)
+                progress.update(suffix=f"images={seen}")
+    progress.close()
 
     label_array = torch.cat(labels).numpy()
     base_tensor = torch.cat(base_scores)
     base_array = base_tensor.numpy()
-    pixel_label_array = torch.cat(pixel_labels).numpy()
-    pixel_score_array = torch.cat(pixel_scores).numpy()
 
     baseline_image = metric_bundle(label_array, base_array)
-    baseline_pixel = metric_bundle(pixel_label_array, pixel_score_array)
-    baseline_aupro = pixel_aupro(np.stack(pixel_label_images), np.stack(pixel_score_images))
+    baseline_metrics = {
+        "image_auroc": baseline_image["auroc"],
+        "image_ap": baseline_image["ap"],
+        "image_f1": baseline_image["f1"],
+        "pixel_auroc": None,
+        "pixel_ap": None,
+        "pixel_f1": None,
+        "pixel_aupro": None,
+    }
+    if pixel_metrics:
+        pixel_label_array = torch.cat(pixel_labels).numpy()
+        pixel_score_array = torch.cat(pixel_scores).numpy()
+        baseline_pixel = metric_bundle(pixel_label_array, pixel_score_array)
+        baseline_metrics.update(
+            {
+                "pixel_auroc": baseline_pixel["auroc"],
+                "pixel_ap": baseline_pixel["ap"],
+                "pixel_f1": baseline_pixel["f1"],
+                "pixel_aupro": (
+                    pixel_aupro(np.stack(pixel_label_images), np.stack(pixel_score_images))
+                    if pixel_aupro_enabled
+                    else None
+                ),
+            }
+        )
 
     summary: Dict[str, Any] = {
         "num_images": int(label_array.shape[0]),
         "num_anomalies": int(label_array.sum()),
-        "baseline": {
-            "image_auroc": baseline_image["auroc"],
-            "image_ap": baseline_image["ap"],
-            "image_f1": baseline_image["f1"],
-            "pixel_auroc": baseline_pixel["auroc"],
-            "pixel_ap": baseline_pixel["ap"],
-            "pixel_f1": baseline_pixel["f1"],
-            "pixel_aupro": baseline_aupro,
-        },
+        "baseline": baseline_metrics,
     }
 
     if aux_scores:
@@ -172,6 +236,11 @@ def _load_batch(
     batch_size: int,
 ) -> Tuple[List[Any], List[Any], List[Dict[str, Any]]]:
     rows = [dataset[idx] for idx in range(start, min(start + batch_size, len(dataset)))]
+    images, masks, metas = zip(*rows)
+    return list(images), list(masks), list(metas)
+
+
+def _collate_batch(rows: Sequence[Tuple[Any, Any, Dict[str, Any]]]):
     images, masks, metas = zip(*rows)
     return list(images), list(masks), list(metas)
 
@@ -207,7 +276,7 @@ def _mean_named_metrics(summaries: Iterable[Dict[str, Any]], *, section: str) ->
 
 
 def _is_meanable(value: Any) -> bool:
-    return value is None or isinstance(value, (float, int))
+    return value is None or (isinstance(value, (float, int)) and not isinstance(value, bool))
 
 
 def _module_device(module: torch.nn.Module) -> torch.device:
