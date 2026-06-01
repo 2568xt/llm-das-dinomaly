@@ -203,6 +203,11 @@ def run_pipeline(cfg: Dict[str, Any], *, stage: str = "all") -> Dict[str, Any]:
                 name="baseline_eval",
             )
         if enhancer_summary is None:
+            if eval_enabled:
+                epoch_metrics_path = metrics_dir / "enhancer_epochs.jsonl"
+                if epoch_metrics_path.exists():
+                    epoch_metrics_path.unlink()
+
             def eval_callback(*, head, epoch, loss, fusion_calibration):
                 record = {
                     "epoch": int(epoch),

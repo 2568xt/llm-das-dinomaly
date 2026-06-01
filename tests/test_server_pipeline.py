@@ -337,6 +337,10 @@ def test_server_pipeline_all_stage_writes_training_evaluation_metrics(tmp_path, 
     monkeypatch.setattr("llm_das_dinomaly.pipelines.server_mvtec.build_dinomaly_wrapper", build_dummy_wrapper)
     monkeypatch.setattr("llm_das_dinomaly.pipelines.server_mvtec.train_enhancer_from_cache", fake_train)
 
+    stale_jsonl = output_root / "metrics" / "enhancer_epochs.jsonl"
+    stale_jsonl.parent.mkdir(parents=True)
+    stale_jsonl.write_text('{"epoch": 99, "stale": true}\n', encoding="utf-8")
+
     summary = run_pipeline(
         {
             "runtime": {"output_root": str(output_root), "device": "cpu", "progress": False},
@@ -355,6 +359,12 @@ def test_server_pipeline_all_stage_writes_training_evaluation_metrics(tmp_path, 
     assert (metrics_dir / "baseline_eval.json").exists()
     assert (metrics_dir / "enhancer_epoch_0001.json").exists()
     assert (metrics_dir / "enhancer_epochs.jsonl").exists()
+    epoch_records = [
+        line for line in (metrics_dir / "enhancer_epochs.jsonl").read_text(encoding="utf-8").splitlines() if line
+    ]
+    assert len(epoch_records) == 1
+    assert '"epoch": 1' in epoch_records[0]
+    assert "stale" not in epoch_records[0]
     assert (metrics_dir / "final_enhanced_eval.json").exists()
 
 

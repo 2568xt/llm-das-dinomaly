@@ -98,7 +98,7 @@ def _evaluate_category(
                 images, masks, metas = _load_batch(dataset, start, batch_size)
                 x = wrapper.preprocess(images).to(device)
                 anomaly_map = wrapper.predict_map(x, resize_to=resize_mask)
-                score = _topk_image_score(anomaly_map, topk_ratio=wrapper.cfg.topk_ratio)
+                score = wrapper.predict_score(x)
 
                 batch_labels = torch.tensor([int(meta["label"]) for meta in metas], dtype=torch.long)
                 labels.append(batch_labels)
@@ -184,12 +184,6 @@ def _mask_batch_to_tensor(masks: Sequence[Any], size: Tuple[int, int]) -> torch.
         tensor = F.interpolate(tensor, size=size, mode="nearest")
         tensors.append(tensor)
     return torch.cat(tensors, dim=0)
-
-
-def _topk_image_score(anomaly_map: torch.Tensor, *, topk_ratio: float) -> torch.Tensor:
-    flat = anomaly_map.flatten(1)
-    k = max(1, min(flat.shape[1], int(flat.shape[1] * topk_ratio)))
-    return torch.topk(flat, k=k, dim=1).values.mean(dim=1)
 
 
 def _mean_category_metrics(category_summaries: Dict[str, Any]) -> Dict[str, Any]:
