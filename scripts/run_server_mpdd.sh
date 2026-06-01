@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CONFIG_PATH="${1:-configs/server_mvtec.yaml}"
+CONFIG_PATH="${1:-configs/server_mpdd.yaml}"
 ENV_FILE="${2:-${SERVER_ENV_FILE:-}}"
 OVERRIDE_CANDIDATES=(
   DATASET
@@ -49,8 +49,8 @@ for name in "${OVERRIDE_CANDIDATES[@]}"; do
   fi
 done
 
-if [[ -z "${ENV_FILE}" && -f "configs/server_paths.env" ]]; then
-  ENV_FILE="configs/server_paths.env"
+if [[ -z "${ENV_FILE}" && -f "configs/server_paths_mpdd.env" ]]; then
+  ENV_FILE="configs/server_paths_mpdd.env"
 fi
 
 if [[ ! -f "${CONFIG_PATH}" ]]; then
@@ -74,12 +74,13 @@ for idx in "${!OVERRIDE_NAMES[@]}"; do
 done
 
 RUN_MODE="${RUN_MODE:-smoke}"
-DATASET="${DATASET:-mvtec}"
+DATASET="${DATASET:-mpdd}"
+BASE_TRAIN_IF_MISSING="${BASE_TRAIN_IF_MISSING:-true}"
 export RUN_MODE
 export DATASET
+export BASE_TRAIN_IF_MISSING
 
-: "${DATA_ROOT:?Set DATA_ROOT to the MVTec root, e.g. /data/mvtec_anomaly_detection}"
-: "${CHECKPOINT_PATH:?Set CHECKPOINT_PATH to a trained Dinomaly checkpoint .pth}"
+: "${DATA_ROOT:?Set DATA_ROOT to the MPDD root, e.g. /data/MPDD}"
 : "${OUTPUT_ROOT:?Set OUTPUT_ROOT to a writable output directory}"
 : "${DINOMALY_ROOT:=third_party/Dinomaly}"
 export DINOMALY_ROOT
@@ -91,7 +92,7 @@ if [[ ! -d "${DINOMALY_ROOT}" ]]; then
 fi
 
 if [[ "${RUN_MODE}" == "smoke" ]]; then
-  export MVTEC_CATEGORY="${MVTEC_CATEGORY:-bottle}"
+  export MPDD_CATEGORY="${MPDD_CATEGORY:-bracket_black}"
 fi
 
 echo "[llm-das-dinomaly] config=${CONFIG_PATH}"
@@ -101,9 +102,10 @@ fi
 echo "[llm-das-dinomaly] dataset=${DATASET}"
 echo "[llm-das-dinomaly] mode=${RUN_MODE}"
 echo "[llm-das-dinomaly] data=${DATA_ROOT}"
-echo "[llm-das-dinomaly] checkpoint=${CHECKPOINT_PATH}"
+echo "[llm-das-dinomaly] checkpoint=${CHECKPOINT_PATH:-<auto>}"
 echo "[llm-das-dinomaly] output=${OUTPUT_ROOT}"
 echo "[llm-das-dinomaly] dinomaly=${DINOMALY_ROOT}"
+echo "[llm-das-dinomaly] base_train_if_missing=${BASE_TRAIN_IF_MISSING}"
 
 python -m llm_das_dinomaly.pipelines.server_mvtec --config "${CONFIG_PATH}" --stage check
 python -m llm_das_dinomaly.pipelines.server_mvtec --config "${CONFIG_PATH}" --stage all

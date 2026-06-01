@@ -9,8 +9,17 @@ from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
 import torch
 
-from llm_das_dinomaly.data.mvtec import MVTEC_CLASSES
-from llm_das_dinomaly.data import MVTecGoodDataset, load_tensor_cache, save_tensor_cache, save_torch_payload
+from llm_das_dinomaly.data import (
+    MPDD_CLASSES,
+    MPDDGoodDataset,
+    MPDDTestDataset,
+    MVTEC_CLASSES,
+    MVTecGoodDataset,
+    MVTecTestDataset,
+    load_tensor_cache,
+    save_tensor_cache,
+    save_torch_payload,
+)
 from llm_das_dinomaly.enhancer import (
     MapFeatureHead,
     ScoreNormalizer,
@@ -21,14 +30,38 @@ from llm_das_dinomaly.enhancer import (
 from llm_das_dinomaly.enhancer.heads import binary_enhancer_loss
 from llm_das_dinomaly.evaluation import append_metric_jsonl, evaluate_mvtec_detector, write_metric_json
 from llm_das_dinomaly.integrations import build_dinomaly_wrapper
+from llm_das_dinomaly.integrations.dinomaly import _architecture, _dinomaly_import_context, _init_trainable_layers
 from llm_das_dinomaly.search import NormalScoreStats, SearchConfig, score_aware_search
 from llm_das_dinomaly.utils import ProgressBar, load_yaml_config, require_path, seed_everything
 
 
+DATASET_SPECS = {
+    "mvtec": {
+        "classes": MVTEC_CLASSES,
+        "default_category": "bottle",
+        "good_dataset_cls": MVTecGoodDataset,
+        "test_dataset_cls": MVTecTestDataset,
+    },
+    "mpdd": {
+        "classes": MPDD_CLASSES,
+        "default_category": "bracket_black",
+        "good_dataset_cls": MPDDGoodDataset,
+        "test_dataset_cls": MPDDTestDataset,
+    },
+}
+
+
 def main(argv: Optional[List[str]] = None) -> None:
-    parser = argparse.ArgumentParser(description="Run LLM-DAS Dinomaly MVTec server pipeline.")
-    parser.add_argument("--config", required=True)
-    parser.add_argument("--stage", choices=["check", "hard-samples", "enhancer", "eval", "all"], default="all")
+    parser = argparse.ArgumentParser(description="Run LLM-DAS Dinomaly server pipeline.")
+    parser.add_argument(
+        "--config",
+        required=True,
+    )
+    parser.add_argument(
+        "--stage",
+        choices=["check", "base-train", "hard-samples", "enhancer", "eval", "all"],
+        default="all",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -46,6 +79,7 @@ def run_pipeline(cfg: Dict[str, Any], *, stage: str = "all") -> Dict[str, Any]:
     hard_cfg = cfg.get("hard_samples", {})
     enhancer_cfg = cfg.get("enhancer", {})
     eval_cfg = cfg.get("evaluation", {})
+    base_cfg = cfg.get("base_training", {})
 
     output_root = Path(runtime.get("output_root", "outputs/server_mvtec")).expanduser()
     output_root.mkdir(parents=True, exist_ok=True)
@@ -56,14 +90,21 @@ def run_pipeline(cfg: Dict[str, Any], *, stage: str = "all") -> Dict[str, Any]:
     mode = str(runtime.get("mode", "smoke")).lower()
     generator = seed_everything(seed)
 
+    dataset_name = str(data_cfg.get("dataset", runtime.get("dataset", "mvtec"))).strip().lower()
+    dataset_spec = _dataset_spec(dataset_name)
     data_root = require_path(data_cfg["root"], kind="DATA_ROOT")
-    checkpoint_path = require_path(model_cfg["checkpoint_path"], kind="CHECKPOINT_PATH", must_be_file=True)
     dinomaly_root = require_path(model_cfg["dinomaly_root"], kind="DINOMALY_ROOT")
-    categories = data_cfg.get("categories") or ["bottle"]
+    categories = data_cfg.get("categories") or [dataset_spec["default_category"]]
     limit_per_category = data_cfg.get("limit_per_category")
     if mode == "full":
-        categories = list(MVTEC_CLASSES) if categories == ["bottle"] else categories
+        categories = (
+            list(dataset_spec["classes"])
+            if categories == [dataset_spec["default_category"]]
+            else list(categories)
+        )
         limit_per_category = None
+    else:
+        categories = list(categories)
     batch_size = int(runtime.get("batch_size", 16))
     show_progress = _as_bool(runtime.get("progress", True))
     eval_enabled = _as_bool(eval_cfg.get("enabled", True))
@@ -83,21 +124,60 @@ def run_pipeline(cfg: Dict[str, Any], *, stage: str = "all") -> Dict[str, Any]:
     eval_epoch_pixel_metrics = _as_bool(eval_cfg.get("epoch_pixel_metrics", False))
     metrics_dir = output_root / "metrics"
 
-    dataset = MVTecGoodDataset(data_root, categories=categories, limit_per_category=limit_per_category)
+    dataset = dataset_spec["good_dataset_cls"](
+        data_root,
+        categories=categories,
+        limit_per_category=limit_per_category,
+    )
+    checkpoint_path, base_summary = _resolve_base_checkpoint(
+        model_cfg,
+        base_cfg,
+        output_root=output_root,
+        data_root=data_root,
+        dinomaly_root=dinomaly_root,
+        dataset_name=dataset_name,
+        categories=categories,
+        stage=stage,
+        device=device,
+        seed=seed,
+        show_progress=show_progress,
+    )
     summary: Dict[str, Any] = {
         "stage": stage,
         "mode": mode,
+        "dataset": dataset_name,
         "seed": seed,
         "device": device,
         "data_root": str(data_root),
         "categories": categories,
         "num_normal_images": len(dataset),
         "output_root": str(output_root),
-        "checkpoint_path": str(checkpoint_path),
+        "checkpoint_path": None if checkpoint_path is None else str(checkpoint_path),
     }
+    if base_summary:
+        summary["base_checkpoint"] = base_summary
     if stage == "check":
         _write_json(summary_path, summary)
         return summary
+    if stage == "base-train":
+        if checkpoint_path is None:
+            raise FileNotFoundError("CHECKPOINT_PATH is missing and base training did not produce a checkpoint")
+        _write_json(summary_path, summary)
+        return summary
+
+    if checkpoint_path is None:
+        raise FileNotFoundError(
+            "CHECKPOINT_PATH is missing. Set CHECKPOINT_PATH or enable BASE_TRAIN_IF_MISSING for stage=all."
+        )
+
+    backbone = str(model_cfg.get("backbone", "dinov2reg_vit_base_14"))
+    cache_context = _cache_context(
+        dataset_name=dataset_name,
+        categories=categories,
+        data_root=data_root,
+        checkpoint_path=checkpoint_path,
+        backbone=backbone,
+    )
 
     wrapper_pair = None
 
@@ -110,7 +190,7 @@ def run_pipeline(cfg: Dict[str, Any], *, stage: str = "all") -> Dict[str, Any]:
                 dinomaly_root=dinomaly_root,
                 checkpoint_path=checkpoint_path,
                 device=device,
-                backbone=str(model_cfg.get("backbone", "dinov2reg_vit_base_14")),
+                backbone=backbone,
                 strict=bool(model_cfg.get("strict_checkpoint", False)),
             )
             summary["wrapper"] = wrapper_pair[1]
@@ -143,27 +223,34 @@ def run_pipeline(cfg: Dict[str, Any], *, stage: str = "all") -> Dict[str, Any]:
             pixel_metrics=eval_pixel_metrics,
             pixel_aupro=eval_pixel_aupro,
             show_progress=show_progress,
+            test_dataset_cls=dataset_spec["test_dataset_cls"],
         )
         if enhancer_path.is_file():
-            enhancer_head, enhancer_payload = _load_enhancer_head(enhancer_path)
-            evaluation_summary["enhanced"] = _run_and_write_evaluation(
-                get_wrapper(),
-                data_root,
-                categories=categories,
-                batch_size=eval_batch_size,
-                device=device,
-                resize_mask=eval_resize_mask,
-                limit_per_category=eval_limit_per_category,
-                beta=eval_beta,
-                metrics_dir=metrics_dir,
-                name="eval_enhanced",
-                enhancer_head=enhancer_head,
-                fusion_calibration=enhancer_payload.get("fusion_calibration"),
-                num_workers=eval_num_workers,
-                pixel_metrics=eval_pixel_metrics,
-                pixel_aupro=eval_pixel_aupro,
-                show_progress=show_progress,
+            enhancer_summary = _try_summarize_enhancer_checkpoint(
+                enhancer_path,
+                cache_context=cache_context,
             )
+            if enhancer_summary is not None:
+                enhancer_head, enhancer_payload = _load_enhancer_head(enhancer_path)
+                evaluation_summary["enhanced"] = _run_and_write_evaluation(
+                    get_wrapper(),
+                    data_root,
+                    categories=categories,
+                    batch_size=eval_batch_size,
+                    device=device,
+                    resize_mask=eval_resize_mask,
+                    limit_per_category=eval_limit_per_category,
+                    beta=eval_beta,
+                    metrics_dir=metrics_dir,
+                    name="eval_enhanced",
+                    enhancer_head=enhancer_head,
+                    fusion_calibration=enhancer_payload.get("fusion_calibration"),
+                    num_workers=eval_num_workers,
+                    pixel_metrics=eval_pixel_metrics,
+                    pixel_aupro=eval_pixel_aupro,
+                    show_progress=show_progress,
+                    test_dataset_cls=dataset_spec["test_dataset_cls"],
+                )
         summary["evaluation"] = evaluation_summary
         _write_json(summary_path, summary)
         return summary
@@ -178,6 +265,7 @@ def run_pipeline(cfg: Dict[str, Any], *, stage: str = "all") -> Dict[str, Any]:
                 target_samples=hard_target_samples,
                 search_budget=hard_search_budget,
                 cache_images=cache_images,
+                cache_context=cache_context,
             )
         if hard_summary is None:
             hard_summary = generate_hard_samples(
@@ -192,6 +280,7 @@ def run_pipeline(cfg: Dict[str, Any], *, stage: str = "all") -> Dict[str, Any]:
                 cache_images=cache_images,
                 shard_size=hard_shard_size,
                 show_progress=show_progress,
+                cache_context=cache_context,
             )
         summary["hard_samples"] = hard_summary
 
@@ -200,7 +289,10 @@ def run_pipeline(cfg: Dict[str, Any], *, stage: str = "all") -> Dict[str, Any]:
             raise FileNotFoundError(f"hard sample cache does not exist: {hard_cache}")
         enhancer_summary = None
         if enhancer_path.is_file() and not retrain_enhancer:
-            enhancer_summary = _try_summarize_enhancer_checkpoint(enhancer_path)
+            enhancer_summary = _try_summarize_enhancer_checkpoint(
+                enhancer_path,
+                cache_context=cache_context,
+            )
             if eval_enabled and enhancer_summary is not None and "fusion_calibration" not in enhancer_summary:
                 _warn(
                     "existing enhancer checkpoint is missing fusion_calibration; "
@@ -223,6 +315,7 @@ def run_pipeline(cfg: Dict[str, Any], *, stage: str = "all") -> Dict[str, Any]:
                 pixel_metrics=eval_pixel_metrics,
                 pixel_aupro=eval_pixel_aupro,
                 show_progress=show_progress,
+                test_dataset_cls=dataset_spec["test_dataset_cls"],
             )
         if enhancer_summary is None:
             if eval_enabled:
@@ -251,6 +344,7 @@ def run_pipeline(cfg: Dict[str, Any], *, stage: str = "all") -> Dict[str, Any]:
                         pixel_metrics=eval_epoch_pixel_metrics,
                         pixel_aupro=False,
                         show_progress=show_progress,
+                        test_dataset_cls=dataset_spec["test_dataset_cls"],
                     ),
                 }
                 append_metric_jsonl(metrics_dir / "enhancer_epochs.jsonl", record)
@@ -265,6 +359,7 @@ def run_pipeline(cfg: Dict[str, Any], *, stage: str = "all") -> Dict[str, Any]:
                 seed=seed,
                 show_progress=show_progress,
                 eval_callback=eval_callback if eval_enabled else None,
+                cache_context=cache_context,
             )
         summary["enhancer"] = enhancer_summary
         if eval_enabled and enhancer_path.is_file():
@@ -286,15 +381,415 @@ def run_pipeline(cfg: Dict[str, Any], *, stage: str = "all") -> Dict[str, Any]:
                 pixel_metrics=eval_pixel_metrics,
                 pixel_aupro=eval_pixel_aupro,
                 show_progress=show_progress,
+                test_dataset_cls=dataset_spec["test_dataset_cls"],
             )
 
     _write_json(summary_path, summary)
     return summary
 
 
+def _dataset_spec(dataset_name: str) -> Dict[str, Any]:
+    if dataset_name not in DATASET_SPECS:
+        expected = ", ".join(sorted(DATASET_SPECS))
+        raise ValueError(f"unsupported DATASET={dataset_name!r}; expected one of: {expected}")
+    return DATASET_SPECS[dataset_name]
+
+
+def _resolve_base_checkpoint(
+    model_cfg: Dict[str, Any],
+    base_cfg: Dict[str, Any],
+    *,
+    output_root: Path,
+    data_root: Path,
+    dinomaly_root: Path,
+    dataset_name: str,
+    categories: Sequence[str],
+    stage: str,
+    device: str,
+    seed: int,
+    show_progress: bool,
+) -> Tuple[Optional[Path], Dict[str, Any]]:
+    backbone = str(model_cfg.get("backbone", "dinov2reg_vit_base_14"))
+    explicit_checkpoint = str(model_cfg.get("checkpoint_path", "") or "").strip()
+    train_if_missing = _as_bool(base_cfg.get("train_if_missing", False))
+    force_retrain = _as_bool(base_cfg.get("force_retrain", False))
+    total_iters = int(base_cfg.get("total_iters", 10000))
+    eval_interval = int(base_cfg.get("eval_interval", 5000))
+    batch_size = int(base_cfg.get("batch_size", 16))
+    num_workers = int(base_cfg.get("num_workers", 4))
+    checkpoint_dir = Path(base_cfg.get("checkpoint_dir") or (output_root / "base_checkpoints")).expanduser()
+
+    if explicit_checkpoint:
+        checkpoint = require_path(explicit_checkpoint, kind="CHECKPOINT_PATH", must_be_file=True)
+        return checkpoint, {
+            "source": "explicit",
+            "checkpoint_path": str(checkpoint),
+            "trained": False,
+            "train_if_missing": train_if_missing,
+            "force_retrain": force_retrain,
+        }
+
+    if not force_retrain:
+        found = _find_existing_base_checkpoint(
+            dataset_name=dataset_name,
+            backbone=backbone,
+            total_iters=total_iters,
+            checkpoint_dirs=[checkpoint_dir, Path("checkpoints")],
+        )
+        if found is not None:
+            return found, {
+                "source": "search",
+                "checkpoint_path": str(found),
+                "trained": False,
+                "train_if_missing": train_if_missing,
+                "force_retrain": force_retrain,
+            }
+
+    should_train = stage == "base-train" or (stage == "all" and train_if_missing)
+    if should_train:
+        output_path = checkpoint_dir / _base_checkpoint_filename(
+            dataset_name=dataset_name,
+            backbone=backbone,
+            total_iters=total_iters,
+        )
+        training_summary = train_unified_dinomaly_checkpoint(
+            dinomaly_root=dinomaly_root,
+            data_root=data_root,
+            output_path=output_path,
+            categories=categories,
+            backbone=backbone,
+            device=device,
+            total_iters=total_iters,
+            eval_interval=eval_interval,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            seed=seed,
+            show_progress=show_progress,
+        )
+        training_summary.update(
+            {
+                "source": "trained",
+                "train_if_missing": train_if_missing,
+                "force_retrain": force_retrain,
+            }
+        )
+        return Path(training_summary["checkpoint_path"]), training_summary
+
+    if stage == "check" and train_if_missing:
+        return None, {
+            "source": "missing",
+            "checkpoint_path": None,
+            "trained": False,
+            "will_train_if_missing": True,
+            "train_if_missing": train_if_missing,
+            "force_retrain": force_retrain,
+            "checkpoint_search_dirs": [str(checkpoint_dir), "checkpoints"],
+        }
+
+    raise FileNotFoundError(
+        "CHECKPOINT_PATH is not set and no existing "
+        f"{dataset_name.upper()} unified checkpoint was found under {checkpoint_dir} or checkpoints/"
+    )
+
+
+def _find_existing_base_checkpoint(
+    *,
+    dataset_name: str,
+    backbone: str,
+    total_iters: int,
+    checkpoint_dirs: Sequence[Path],
+) -> Optional[Path]:
+    names = [
+        _base_checkpoint_filename(dataset_name=dataset_name, backbone=backbone, total_iters=total_iters),
+        f"{dataset_name}_unified.pth",
+        f"{dataset_name}_vitb_unified.pth",
+        f"{dataset_name}_vitb_it{max(1, total_iters // 1000)}k.pth",
+    ]
+    for directory in checkpoint_dirs:
+        directory = directory.expanduser()
+        for name in names:
+            candidate = directory / name
+            if candidate.is_file():
+                return candidate
+        matches = sorted(directory.glob(f"{dataset_name}*unified*.pth")) if directory.is_dir() else []
+        if matches:
+            return matches[0]
+        matches = sorted(directory.glob(f"{dataset_name}*.pth")) if directory.is_dir() else []
+        if matches:
+            return matches[0]
+    return None
+
+
+def _base_checkpoint_filename(*, dataset_name: str, backbone: str, total_iters: int) -> str:
+    safe_backbone = "".join(char if char.isalnum() or char in "._-" else "_" for char in backbone)
+    return f"{dataset_name}_unified_{safe_backbone}_it{max(1, total_iters // 1000)}k.pth"
+
+
+def train_unified_dinomaly_checkpoint(
+    *,
+    dinomaly_root: Path,
+    data_root: Path,
+    output_path: Path,
+    categories: Sequence[str],
+    backbone: str,
+    device: str,
+    total_iters: int,
+    eval_interval: int,
+    batch_size: int,
+    num_workers: int,
+    seed: int,
+    show_progress: bool = True,
+) -> Dict[str, Any]:
+    seed_everything(seed)
+    data_root = Path(data_root).expanduser().resolve()
+    output_path = Path(output_path).expanduser()
+    total_iters = max(1, int(total_iters))
+    batch_size = max(1, int(batch_size))
+    num_workers = max(0, int(num_workers))
+    image_size = 448
+    crop_size = 392
+    metrics: List[Dict[str, Any]] = []
+    losses: List[float] = []
+
+    with _dinomaly_import_context(Path(dinomaly_root).expanduser().resolve()):
+        from dataset import MVTecDataset, get_data_transforms
+        from dinov1.utils import trunc_normal_
+        from models import vit_encoder
+        from models.uad import ViTill
+        from models.vision_transformer import LinearAttention2
+        from models.vision_transformer import Block as VitBlock
+        from models.vision_transformer import bMlp
+        from optimizers import StableAdamW
+        from torch.utils.data import ConcatDataset, DataLoader
+        from torchvision.datasets import ImageFolder
+        from utils import WarmCosineScheduler, evaluation_batch, global_cosine_hm_percent
+        from functools import partial
+        import numpy as np
+        import torch.nn as nn
+
+        data_transform, gt_transform = get_data_transforms(image_size, crop_size)
+        train_sets = []
+        test_sets = []
+        for category_index, category in enumerate(categories):
+            train_path = data_root / category / "train"
+            category_root = data_root / category
+            if not train_path.is_dir():
+                raise FileNotFoundError(f"MPDD train path does not exist: {train_path}")
+            if not (category_root / "test").is_dir():
+                raise FileNotFoundError(f"MPDD test path does not exist: {category_root / 'test'}")
+            train_data = ImageFolder(root=str(train_path), transform=data_transform)
+            train_data.classes = [category]
+            train_data.class_to_idx = {category: category_index}
+            train_data.samples = [(sample_path, category_index) for sample_path, _ in train_data.samples]
+            train_sets.append(train_data)
+            test_sets.append(
+                MVTecDataset(
+                    root=str(category_root),
+                    transform=data_transform,
+                    gt_transform=gt_transform,
+                    phase="test",
+                )
+            )
+
+        train_data = ConcatDataset(train_sets)
+        if len(train_data) == 0:
+            raise ValueError("base training found no train/good images")
+        train_loader = DataLoader(
+            train_data,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            drop_last=len(train_data) >= batch_size,
+        )
+        if len(train_loader) == 0:
+            raise ValueError("base training dataloader is empty")
+
+        target_layers, fuse_encoder, fuse_decoder, embed_dim, num_heads = _architecture(backbone)
+        encoder = vit_encoder.load(backbone)
+        bottleneck = nn.ModuleList([bMlp(embed_dim, embed_dim * 4, embed_dim, drop=0.2)])
+        decoder = nn.ModuleList(
+            [
+                VitBlock(
+                    dim=embed_dim,
+                    num_heads=num_heads,
+                    mlp_ratio=4.0,
+                    qkv_bias=True,
+                    norm_layer=partial(nn.LayerNorm, eps=1e-8),
+                    attn=LinearAttention2,
+                )
+                for _ in range(8)
+            ]
+        )
+        model = ViTill(
+            encoder=encoder,
+            bottleneck=bottleneck,
+            decoder=decoder,
+            target_layers=target_layers,
+            mask_neighbor_size=0,
+            fuse_layer_encoder=fuse_encoder,
+            fuse_layer_decoder=fuse_decoder,
+        ).to(device)
+        _init_trainable_layers(model, trunc_normal_)
+        trainable = nn.ModuleList([model.bottleneck, model.decoder])
+        optimizer = StableAdamW(
+            [{"params": trainable.parameters()}],
+            lr=2e-3,
+            betas=(0.9, 0.999),
+            weight_decay=1e-4,
+            amsgrad=True,
+            eps=1e-10,
+        )
+        scheduler = WarmCosineScheduler(
+            optimizer,
+            base_value=2e-3,
+            final_value=2e-4,
+            total_iters=total_iters,
+            warmup_iters=100,
+        )
+
+        progress = ProgressBar(total_iters, label="base training", enabled=show_progress)
+        it = 0
+        last_loss = None
+        while it < total_iters:
+            model.train()
+            for images, _ in train_loader:
+                images = images.to(device)
+                en, de = model(images)
+                p = min(0.9 * it / 1000, 0.9)
+                loss = global_cosine_hm_percent(en, de, p=p, factor=0.1)
+                optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(trainable.parameters(), max_norm=0.1)
+                optimizer.step()
+                scheduler.step()
+                last_loss = float(loss.item())
+                losses.append(last_loss)
+                it += 1
+                progress.update(suffix=f"loss={last_loss:.6f}")
+
+                should_eval = eval_interval > 0 and (it % eval_interval == 0 or it == total_iters)
+                if should_eval:
+                    metrics.append(
+                        _evaluate_official_base_model(
+                            model=model,
+                            test_sets=test_sets,
+                            categories=categories,
+                            batch_size=batch_size,
+                            num_workers=num_workers,
+                            device=device,
+                            evaluation_batch=evaluation_batch,
+                            data_loader_cls=DataLoader,
+                            np_module=np,
+                        )
+                    )
+                    model.train()
+                if it >= total_iters:
+                    break
+        progress.close()
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(model.state_dict(), output_path)
+
+    return {
+        "checkpoint_path": str(output_path),
+        "trained": True,
+        "categories": list(categories),
+        "total_iters": total_iters,
+        "batch_size": batch_size,
+        "num_workers": num_workers,
+        "image_size": image_size,
+        "crop_size": crop_size,
+        "final_loss": last_loss,
+        "losses_tail": losses[-10:],
+        "metrics": metrics,
+    }
+
+
+def _evaluate_official_base_model(
+    *,
+    model,
+    test_sets: Sequence[Any],
+    categories: Sequence[str],
+    batch_size: int,
+    num_workers: int,
+    device: str,
+    evaluation_batch,
+    data_loader_cls,
+    np_module,
+) -> Dict[str, Any]:
+    rows = []
+    for category, test_data in zip(categories, test_sets):
+        test_loader = data_loader_cls(
+            test_data,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+        )
+        auroc_sp, ap_sp, f1_sp, auroc_px, ap_px, f1_px, aupro_px = evaluation_batch(
+            model,
+            test_loader,
+            device,
+            max_ratio=0.01,
+            resize_mask=256,
+        )
+        rows.append(
+            {
+                "category": category,
+                "image_auroc": float(auroc_sp),
+                "image_ap": float(ap_sp),
+                "image_f1": float(f1_sp),
+                "pixel_auroc": float(auroc_px),
+                "pixel_ap": float(ap_px),
+                "pixel_f1": float(f1_px),
+                "pixel_aupro": float(aupro_px),
+            }
+        )
+
+    mean = {}
+    for key in ("image_auroc", "image_ap", "image_f1", "pixel_auroc", "pixel_ap", "pixel_f1", "pixel_aupro"):
+        mean[key] = float(np_module.mean([row[key] for row in rows]))
+    return {"categories": rows, "mean": mean}
+
+
+def _cache_context(
+    *,
+    dataset_name: str,
+    categories: Sequence[str],
+    data_root: Path,
+    checkpoint_path: Path,
+    backbone: str,
+) -> Dict[str, Any]:
+    return {
+        "dataset": dataset_name,
+        "categories": list(categories),
+        "data_root": str(Path(data_root).expanduser()),
+        "checkpoint_path": str(Path(checkpoint_path).expanduser()),
+        "backbone": backbone,
+    }
+
+
+def _normalize_cache_context(context: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not context:
+        return None
+    return {
+        "dataset": str(context.get("dataset")),
+        "categories": [str(category) for category in context.get("categories", [])],
+        "data_root": str(context.get("data_root")),
+        "checkpoint_path": str(context.get("checkpoint_path")),
+        "backbone": str(context.get("backbone")),
+    }
+
+
+def _cache_context_matches(existing: Any, expected: Optional[Dict[str, Any]]) -> bool:
+    normalized_expected = _normalize_cache_context(expected)
+    if normalized_expected is None:
+        return True
+    return existing == normalized_expected
+
+
 def generate_hard_samples(
     wrapper,
-    dataset: MVTecGoodDataset,
+    dataset,
     output_path: Path,
     *,
     batch_size: int,
@@ -305,10 +800,11 @@ def generate_hard_samples(
     cache_images: bool = False,
     shard_size: int = 32,
     show_progress: bool = True,
+    cache_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     target_samples = min(len(dataset), max_samples)
     if target_samples <= 0:
-        raise ValueError("max_samples must select at least one MVTec train/good image")
+        raise ValueError("max_samples must select at least one train/good image")
     batch_size = max(1, int(batch_size))
     shard_size = max(1, int(shard_size))
     target_batches = (target_samples + batch_size - 1) // batch_size
@@ -333,6 +829,7 @@ def generate_hard_samples(
         target_samples=target_samples,
         search_budget=search_budget,
         cache_images=cache_images,
+        cache_context=cache_context,
     )
 
     buffer = _new_hard_sample_buffer(cache_images=cache_images)
@@ -400,6 +897,7 @@ def generate_hard_samples(
                         stats=stats,
                         search_budget=search_budget,
                         cache_images=cache_images,
+                        cache_context=cache_context,
                     )
                     completed_indices.update(saved_indices)
                     buffer = _new_hard_sample_buffer(cache_images=cache_images)
@@ -411,6 +909,7 @@ def generate_hard_samples(
             stats=stats,
             search_budget=search_budget,
             cache_images=cache_images,
+            cache_context=cache_context,
         )
         completed_indices.update(saved_indices)
     search_progress.close()
@@ -427,6 +926,7 @@ def generate_hard_samples(
         stats=stats,
         search_budget=search_budget,
         cache_images=cache_images,
+        cache_context=cache_context,
     )
     summary["generated_candidates"] = generated_count
     summary["resumed_from_shards"] = cached_count > 0
@@ -443,6 +943,7 @@ def train_enhancer_from_cache(
     seed: int,
     show_progress: bool = True,
     eval_callback=None,
+    cache_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     seed_everything(seed)
     payload = load_tensor_cache(cache_path)
@@ -499,6 +1000,7 @@ def train_enhancer_from_cache(
             "epochs": epochs,
             "losses": losses,
             "fusion_calibration": final_calibration,
+            "cache_context": _normalize_cache_context(cache_context),
         },
     )
     summary = {
@@ -509,6 +1011,7 @@ def train_enhancer_from_cache(
         "final_loss": losses[-1],
         "fused_score_mean": float(fused.mean().item()),
         "fusion_calibration": final_calibration,
+        "cache_context": _normalize_cache_context(cache_context),
     }
     if epoch_evaluations:
         summary["epoch_evaluations"] = epoch_evaluations
@@ -516,7 +1019,7 @@ def train_enhancer_from_cache(
 
 
 def _iter_dataset_batches(
-    dataset: MVTecGoodDataset,
+    dataset,
     total: int,
     batch_size: int,
 ) -> Iterator[Tuple[int, List[Any], List[Dict[str, Any]]]]:
@@ -607,6 +1110,7 @@ def _save_hard_sample_shard(
     stats: NormalScoreStats,
     search_budget: int,
     cache_images: bool,
+    cache_context: Optional[Dict[str, Any]] = None,
 ) -> Set[int]:
     indices = [int(idx) for idx in buffer["sample_indices"]]
     if not indices:
@@ -638,6 +1142,7 @@ def _save_hard_sample_shard(
         "source_records": list(buffer["source_records"]),
         "search_budget": int(search_budget),
         "cache_images": bool(cache_images),
+        "cache_context": _normalize_cache_context(cache_context),
     }
     save_tensor_cache(shard_path, tensors, metadata)
     return set(indices)
@@ -651,12 +1156,18 @@ def _merge_hard_sample_shards(
     stats: NormalScoreStats,
     search_budget: int,
     cache_images: bool,
+    cache_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     entries = {}
     used_shards = []
     for shard_path in _iter_shard_paths(shard_dir):
         payload = load_tensor_cache(shard_path)
-        if not _is_compatible_hard_shard(payload, search_budget=search_budget, cache_images=cache_images):
+        if not _is_compatible_hard_shard(
+            payload,
+            search_budget=search_budget,
+            cache_images=cache_images,
+            cache_context=cache_context,
+        ):
             continue
         tensors = payload["tensors"]
         metadata = payload.get("metadata", {})
@@ -704,6 +1215,7 @@ def _merge_hard_sample_shards(
         "image_tensors_location": "shards" if cache_images else "not_saved",
         "shard_dir": str(shard_dir),
         "num_shards": len(used_shards),
+        "cache_context": _normalize_cache_context(cache_context),
     }
     save_tensor_cache(output_path, tensors, metadata)
     return _summarize_hard_cache_payload({"tensors": tensors, "metadata": metadata}, output_path, reused=False)
@@ -715,6 +1227,7 @@ def _load_completed_sample_indices(
     target_samples: int,
     search_budget: int,
     cache_images: bool,
+    cache_context: Optional[Dict[str, Any]] = None,
 ) -> Set[int]:
     completed: Set[int] = set()
     for shard_path in _iter_shard_paths(shard_dir):
@@ -723,7 +1236,12 @@ def _load_completed_sample_indices(
         except Exception as exc:
             _warn(f"ignoring unreadable hard sample shard {shard_path}: {exc}")
             continue
-        if not _is_compatible_hard_shard(payload, search_budget=search_budget, cache_images=cache_images):
+        if not _is_compatible_hard_shard(
+            payload,
+            search_budget=search_budget,
+            cache_images=cache_images,
+            cache_context=cache_context,
+        ):
             continue
         completed.update(idx for idx in _payload_sample_indices(payload) if idx < target_samples)
     return completed
@@ -735,13 +1253,21 @@ def _iter_shard_paths(shard_dir: Path) -> List[Path]:
     return sorted(shard_dir.glob("shard-*.pt"))
 
 
-def _is_compatible_hard_shard(payload: Dict[str, Any], *, search_budget: int, cache_images: bool) -> bool:
+def _is_compatible_hard_shard(
+    payload: Dict[str, Any],
+    *,
+    search_budget: int,
+    cache_images: bool,
+    cache_context: Optional[Dict[str, Any]] = None,
+) -> bool:
     metadata = payload.get("metadata", {})
     if metadata.get("type") != "hard_sample_shard":
         return False
     if int(metadata.get("search_budget", -1)) != int(search_budget):
         return False
     if cache_images and not _as_bool(metadata.get("cache_images", False)):
+        return False
+    if not _cache_context_matches(metadata.get("cache_context"), cache_context):
         return False
     return True
 
@@ -759,6 +1285,7 @@ def _try_summarize_hard_cache(
     target_samples: int,
     search_budget: int,
     cache_images: bool,
+    cache_context: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     try:
         payload = load_tensor_cache(path)
@@ -775,6 +1302,9 @@ def _try_summarize_hard_cache(
             return None
         if cache_images and not _as_bool(metadata.get("cache_images", False)):
             _warn("existing hard sample cache has no image shards but CACHE_IMAGES=true; regenerating")
+            return None
+        if not _cache_context_matches(metadata.get("cache_context"), cache_context):
+            _warn("existing hard sample cache was built for a different dataset/checkpoint; regenerating")
             return None
         return summary
     except Exception as exc:
@@ -802,12 +1332,22 @@ def _summarize_hard_cache_payload(payload: Dict[str, Any], path: Path, *, reused
         "image_tensors_location": metadata.get("image_tensors_location", "cache"),
         "shard_dir": metadata.get("shard_dir"),
         "num_shards": metadata.get("num_shards"),
+        "cache_context": metadata.get("cache_context"),
     }
 
 
-def _try_summarize_enhancer_checkpoint(path: Path) -> Optional[Dict[str, Any]]:
+def _try_summarize_enhancer_checkpoint(
+    path: Path,
+    *,
+    cache_context: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
     try:
         payload = torch.load(path, map_location="cpu")
+        if not isinstance(payload, dict):
+            raise ValueError(f"enhancer checkpoint has unsupported payload type: {type(payload)!r}")
+        if not _cache_context_matches(payload.get("cache_context"), cache_context):
+            _warn("existing enhancer checkpoint was built for a different dataset/checkpoint; retraining")
+            return None
         losses = payload.get("losses", [])
         summary = {
             "checkpoint_path": str(path),
@@ -820,6 +1360,8 @@ def _try_summarize_enhancer_checkpoint(path: Path) -> Optional[Dict[str, Any]]:
             summary["final_loss"] = float(losses[-1])
         if "fusion_calibration" in payload:
             summary["fusion_calibration"] = payload["fusion_calibration"]
+        if "cache_context" in payload:
+            summary["cache_context"] = payload["cache_context"]
         return summary
     except Exception as exc:
         _quarantine_unreadable_file(path, "enhancer checkpoint", exc)
@@ -866,6 +1408,7 @@ def _run_and_write_evaluation(
     pixel_metrics: bool = True,
     pixel_aupro: bool = False,
     show_progress: bool = True,
+    test_dataset_cls=MVTecTestDataset,
 ) -> Dict[str, Any]:
     base_normalizer = None
     aux_normalizer = None
@@ -897,6 +1440,7 @@ def _run_and_write_evaluation(
         show_progress=show_progress,
         progress_label=name,
         progress_path=metrics_dir / f"{name}.progress.json",
+        test_dataset_cls=test_dataset_cls,
     )
     write_metric_json(metrics_dir / f"{name}.json", payload)
     return payload

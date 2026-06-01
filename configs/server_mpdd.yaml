@@ -1,26 +1,26 @@
 runtime:
   mode: ${RUN_MODE:-smoke}
-  dataset: ${DATASET:-mvtec}
+  dataset: ${DATASET:-mpdd}
   device: ${DEVICE:-cuda}
   seed: 7
   batch_size: ${BATCH_SIZE:-16}
-  output_root: ${OUTPUT_ROOT:-outputs/server_mvtec}
+  output_root: ${OUTPUT_ROOT:-outputs/server_mpdd}
   progress: ${PROGRESS:-true}
 
 model:
   dinomaly_root: ${DINOMALY_ROOT:-third_party/Dinomaly}
-  checkpoint_path: ${CHECKPOINT_PATH}
+  checkpoint_path: ${CHECKPOINT_PATH:-}
   backbone: dinov2reg_vit_base_14
   strict_checkpoint: false
 
 data:
-  dataset: ${DATASET:-mvtec}
+  dataset: ${DATASET:-mpdd}
   root: ${DATA_ROOT}
-  categories: ["${MVTEC_CATEGORY:-bottle}"]
+  categories: ["${MPDD_CATEGORY:-bracket_black}"]
   limit_per_category: 4
 
 base_training:
-  train_if_missing: ${BASE_TRAIN_IF_MISSING:-false}
+  train_if_missing: ${BASE_TRAIN_IF_MISSING:-true}
   force_retrain: ${BASE_FORCE_RETRAIN:-false}
   total_iters: ${BASE_TOTAL_ITERS:-10000}
   eval_interval: ${BASE_EVAL_INTERVAL:-5000}
@@ -36,9 +36,9 @@ hard_samples:
   regenerate: ${REGENERATE_HARD_SAMPLES:-false}
 
 enhancer:
-  epochs: ${ENHANCER_EPOCHS:-1}
-  hidden_dim: ${ENHANCER_HIDDEN_DIM:-128}
-  lr: ${ENHANCER_LR:-0.001}
+  epochs: ${ENHANCER_EPOCHS:-30}
+  hidden_dim: ${ENHANCER_HIDDEN_DIM:-256}
+  lr: ${ENHANCER_LR:-0.0003}
   retrain: ${RETRAIN_ENHANCER:-false}
 
 evaluation:
@@ -50,4 +50,4 @@ evaluation:
   pixel_metrics: ${EVAL_PIXEL_METRICS:-true}
   pixel_aupro: ${EVAL_PIXEL_AUPRO:-false}
   epoch_pixel_metrics: ${EVAL_EPOCH_PIXEL_METRICS:-false}
-  beta: ${EVAL_FUSION_BETA:-1.0}
+  beta: ${EVAL_FUSION_BETA:-0.5}

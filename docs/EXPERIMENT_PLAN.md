@@ -17,8 +17,10 @@ and higher-risk joint training.
 ## Default Order
 
 1. MVTec for full module bring-up and visual QA.
-2. VisA for generalization.
-3. Real-IAD only after MVTec and VisA show stable positive movement.
+2. MPDD for a lower-ceiling industrial dataset check with the unified Dinomaly
+   base checkpoint path.
+3. VisA for broader generalization.
+4. Real-IAD only after smaller datasets show stable positive movement.
 
 ## Reporting
 
@@ -47,4 +49,13 @@ Use full Dinomaly-style pixel AUPRO only for final parity reports:
 ```bash
 RUN_MODE=full EVAL_BATCH_SIZE=16 EVAL_RESIZE_MASK=256 EVAL_PIXEL_METRICS=true EVAL_PIXEL_AUPRO=true \
 python -m llm_das_dinomaly.pipelines.server_mvtec --config configs/server_mvtec.yaml --stage eval
+```
+
+For MPDD, use the MVTec-like server dataset layout and keep outputs separate
+from MVTec so cache context checks can do their job:
+
+```bash
+RUN_MODE=full MAX_SAMPLES=all SEARCH_BUDGET=24 EVAL_BATCH_SIZE=32 \
+EVAL_PIXEL_AUPRO=false BASE_TRAIN_IF_MISSING=true \
+bash scripts/run_server_mpdd.sh configs/server_mpdd.yaml configs/server_paths_mpdd.env
 ```

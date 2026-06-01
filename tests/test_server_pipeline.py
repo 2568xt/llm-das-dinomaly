@@ -10,7 +10,13 @@ from PIL import Image
 
 from llm_das_dinomaly.data import MVTecGoodDataset, load_tensor_cache, save_tensor_cache, save_torch_payload
 from llm_das_dinomaly.enhancer import MapFeatureHead
-from llm_das_dinomaly.pipelines.server_mvtec import generate_hard_samples, run_pipeline, train_enhancer_from_cache
+from llm_das_dinomaly.pipelines.server_mvtec import (
+    _try_summarize_enhancer_checkpoint,
+    _try_summarize_hard_cache,
+    generate_hard_samples,
+    run_pipeline,
+    train_enhancer_from_cache,
+)
 from llm_das_dinomaly.wrappers import DinomalyConfig, DinomalyWrapper
 
 
@@ -84,6 +90,218 @@ def test_full_mode_expands_default_bottle_to_all_classes(tmp_path):
         stage="check",
     )
     assert "cable" in summary["categories"]
+
+
+def test_mpdd_full_mode_expands_default_category_to_all_mpdd_classes(tmp_path):
+    data_root = _fake_mpdd(tmp_path / "mpdd")
+    checkpoint = tmp_path / "model.pth"
+    checkpoint.write_bytes(b"not-used-in-check-stage")
+    dinomaly_root = tmp_path / "Dinomaly"
+    (dinomaly_root / "models").mkdir(parents=True)
+    (dinomaly_root / "models" / "uad.py").write_text("# fake\n", encoding="utf-8")
+
+    summary = run_pipeline(
+        {
+            "runtime": {"mode": "full", "output_root": str(tmp_path / "out"), "device": "cpu"},
+            "data": {
+                "dataset": "mpdd",
+                "root": str(data_root),
+                "categories": ["bracket_black"],
+                "limit_per_category": 1,
+            },
+            "model": {"dinomaly_root": str(dinomaly_root), "checkpoint_path": str(checkpoint)},
+        },
+        stage="check",
+    )
+
+    assert summary["dataset"] == "mpdd"
+    assert summary["categories"] == [
+        "bracket_black",
+        "bracket_brown",
+        "bracket_white",
+        "connector",
+        "metal_plate",
+        "tubes",
+    ]
+
+
+def test_mpdd_check_stage_allows_missing_checkpoint_when_training_enabled(tmp_path):
+    data_root = _fake_mpdd(tmp_path / "mpdd")
+    dinomaly_root = tmp_path / "Dinomaly"
+    (dinomaly_root / "models").mkdir(parents=True)
+    (dinomaly_root / "models" / "uad.py").write_text("# fake\n", encoding="utf-8")
+
+    summary = run_pipeline(
+        {
+            "runtime": {"output_root": str(tmp_path / "out"), "device": "cpu", "progress": False},
+            "data": {"dataset": "mpdd", "root": str(data_root), "categories": ["bracket_black"]},
+            "model": {"dinomaly_root": str(dinomaly_root), "checkpoint_path": ""},
+            "base_training": {"train_if_missing": True, "checkpoint_dir": str(tmp_path / "base")},
+        },
+        stage="check",
+    )
+
+    assert summary["checkpoint_path"] is None
+    assert summary["base_checkpoint"]["will_train_if_missing"] is True
+
+
+def test_missing_checkpoint_errors_when_base_training_disabled(tmp_path):
+    data_root = _fake_mpdd(tmp_path / "mpdd")
+    dinomaly_root = tmp_path / "Dinomaly"
+    (dinomaly_root / "models").mkdir(parents=True)
+    (dinomaly_root / "models" / "uad.py").write_text("# fake\n", encoding="utf-8")
+
+    with pytest.raises(FileNotFoundError, match="CHECKPOINT_PATH is not set"):
+        run_pipeline(
+            {
+                "runtime": {"output_root": str(tmp_path / "out"), "device": "cpu", "progress": False},
+                "data": {"dataset": "mpdd", "root": str(data_root), "categories": ["bracket_black"]},
+                "model": {"dinomaly_root": str(dinomaly_root), "checkpoint_path": ""},
+                "base_training": {"train_if_missing": False, "checkpoint_dir": str(tmp_path / "base")},
+            },
+            stage="check",
+        )
+
+
+def test_existing_base_checkpoint_is_found_when_checkpoint_path_is_empty(tmp_path):
+    data_root = _fake_mpdd(tmp_path / "mpdd")
+    dinomaly_root = tmp_path / "Dinomaly"
+    (dinomaly_root / "models").mkdir(parents=True)
+    (dinomaly_root / "models" / "uad.py").write_text("# fake\n", encoding="utf-8")
+    checkpoint_dir = tmp_path / "base"
+    checkpoint_dir.mkdir()
+    checkpoint = checkpoint_dir / "mpdd_unified_dinov2reg_vit_base_14_it10k.pth"
+    checkpoint.write_bytes(b"found")
+
+    summary = run_pipeline(
+        {
+            "runtime": {"output_root": str(tmp_path / "out"), "device": "cpu", "progress": False},
+            "data": {"dataset": "mpdd", "root": str(data_root), "categories": ["bracket_black"]},
+            "model": {"dinomaly_root": str(dinomaly_root), "checkpoint_path": ""},
+            "base_training": {"checkpoint_dir": str(checkpoint_dir), "total_iters": 10000},
+        },
+        stage="check",
+    )
+
+    assert summary["checkpoint_path"] == str(checkpoint)
+    assert summary["base_checkpoint"]["source"] == "search"
+
+
+def test_base_train_stage_invokes_training_when_checkpoint_missing(tmp_path, monkeypatch):
+    data_root = _fake_mpdd(tmp_path / "mpdd")
+    dinomaly_root = tmp_path / "Dinomaly"
+    (dinomaly_root / "models").mkdir(parents=True)
+    (dinomaly_root / "models" / "uad.py").write_text("# fake\n", encoding="utf-8")
+    calls = []
+
+    def fake_base_train(**kwargs):
+        calls.append(kwargs)
+        Path(kwargs["output_path"]).parent.mkdir(parents=True, exist_ok=True)
+        Path(kwargs["output_path"]).write_bytes(b"trained")
+        return {
+            "checkpoint_path": str(kwargs["output_path"]),
+            "trained": True,
+            "total_iters": kwargs["total_iters"],
+        }
+
+    monkeypatch.setattr("llm_das_dinomaly.pipelines.server_mvtec.train_unified_dinomaly_checkpoint", fake_base_train)
+    summary = run_pipeline(
+        {
+            "runtime": {"output_root": str(tmp_path / "out"), "device": "cpu", "progress": False},
+            "data": {"dataset": "mpdd", "root": str(data_root), "categories": ["bracket_black"]},
+            "model": {"dinomaly_root": str(dinomaly_root), "checkpoint_path": ""},
+            "base_training": {
+                "checkpoint_dir": str(tmp_path / "base"),
+                "total_iters": 123,
+                "eval_interval": 50,
+            },
+        },
+        stage="base-train",
+    )
+
+    assert calls
+    assert calls[0]["categories"] == ["bracket_black"]
+    assert summary["base_checkpoint"]["source"] == "trained"
+    assert summary["checkpoint_path"].endswith("mpdd_unified_dinov2reg_vit_base_14_it1k.pth")
+
+
+def test_all_stage_trains_missing_mpdd_base_before_reusing_matching_artifacts(tmp_path, monkeypatch):
+    data_root = _fake_mpdd(tmp_path / "mpdd")
+    dinomaly_root = tmp_path / "Dinomaly"
+    (dinomaly_root / "models").mkdir(parents=True)
+    (dinomaly_root / "models" / "uad.py").write_text("# fake\n", encoding="utf-8")
+    output_root = tmp_path / "out"
+    checkpoint = tmp_path / "base" / "mpdd_unified_dinov2reg_vit_base_14_it1k.pth"
+    context = {
+        "dataset": "mpdd",
+        "categories": ["bracket_black"],
+        "data_root": str(data_root),
+        "checkpoint_path": str(checkpoint),
+        "backbone": "dinov2reg_vit_base_14",
+    }
+    save_tensor_cache(
+        output_root / "hard_samples.pt",
+        {
+            "sample_indices": torch.tensor([0]),
+            "hardness": torch.tensor([0.3]),
+            "enhancer_features": torch.ones(2, 3),
+            "labels": torch.tensor([0.0, 1.0]),
+            "base_scores": torch.tensor([0.1, 0.2]),
+        },
+        {
+            "normal_stats": {"mean": 0.1, "std": 0.01},
+            "num_candidates": 1,
+            "search_budget": 4,
+            "cache_images": False,
+            "cache_context": context,
+        },
+    )
+    save_torch_payload(
+        output_root / "enhancer.pt",
+        {
+            "state_dict": {},
+            "input_dim": 3,
+            "hidden_dim": 8,
+            "epochs": 1,
+            "losses": [0.2],
+            "fusion_calibration": {
+                "base": {"lo": 0.1, "hi": 0.2},
+                "aux": {"lo": 0.3, "hi": 0.4},
+            },
+            "cache_context": context,
+        },
+    )
+
+    def fake_base_train(**kwargs):
+        Path(kwargs["output_path"]).parent.mkdir(parents=True, exist_ok=True)
+        Path(kwargs["output_path"]).write_bytes(b"trained")
+        return {"checkpoint_path": str(kwargs["output_path"]), "trained": True}
+
+    def fail_build_wrapper(**kwargs):
+        raise AssertionError("Dinomaly should not load when matching artifacts are reused")
+
+    monkeypatch.setattr("llm_das_dinomaly.pipelines.server_mvtec.train_unified_dinomaly_checkpoint", fake_base_train)
+    monkeypatch.setattr("llm_das_dinomaly.pipelines.server_mvtec.build_dinomaly_wrapper", fail_build_wrapper)
+    summary = run_pipeline(
+        {
+            "runtime": {"output_root": str(output_root), "device": "cpu", "progress": False},
+            "data": {"dataset": "mpdd", "root": str(data_root), "categories": ["bracket_black"]},
+            "model": {"dinomaly_root": str(dinomaly_root), "checkpoint_path": ""},
+            "base_training": {
+                "train_if_missing": True,
+                "checkpoint_dir": str(tmp_path / "base"),
+                "total_iters": 123,
+            },
+            "hard_samples": {"search_budget": 4, "max_samples": 1},
+            "enhancer": {"hidden_dim": 8},
+            "evaluation": {"enabled": False},
+        },
+        stage="all",
+    )
+
+    assert summary["base_checkpoint"]["source"] == "trained"
+    assert summary["hard_samples"]["reused"] is True
+    assert summary["enhancer"]["reused"] is True
 
 
 def test_hard_sample_generation_writes_compact_shards_by_default(tmp_path):
@@ -174,6 +392,7 @@ def test_server_pipeline_reuses_existing_cache_and_enhancer(tmp_path, monkeypatc
             "num_candidates": 1,
             "search_budget": 4,
             "cache_images": False,
+            "cache_context": _expected_cache_context(data_root, checkpoint),
         },
     )
     save_torch_payload(
@@ -188,6 +407,7 @@ def test_server_pipeline_reuses_existing_cache_and_enhancer(tmp_path, monkeypatc
                 "base": {"lo": 0.1, "hi": 0.2},
                 "aux": {"lo": 0.3, "hi": 0.4},
             },
+            "cache_context": _expected_cache_context(data_root, checkpoint),
         },
     )
 
@@ -211,6 +431,69 @@ def test_server_pipeline_reuses_existing_cache_and_enhancer(tmp_path, monkeypatc
     assert summary["enhancer"]["reused"] is True
     assert summary["enhancer"]["fusion_calibration"]["base"] == {"lo": 0.1, "hi": 0.2}
     assert "wrapper" not in summary
+
+
+def test_cache_context_mismatch_rejects_hard_cache_and_enhancer(tmp_path):
+    cache_path = tmp_path / "hard_samples.pt"
+    enhancer_path = tmp_path / "enhancer.pt"
+    save_tensor_cache(
+        cache_path,
+        {
+            "sample_indices": torch.tensor([0]),
+            "hardness": torch.tensor([0.3]),
+            "enhancer_features": torch.ones(2, 3),
+            "labels": torch.tensor([0.0, 1.0]),
+            "base_scores": torch.tensor([0.1, 0.2]),
+        },
+        {
+            "normal_stats": {"mean": 0.1, "std": 0.01},
+            "num_candidates": 1,
+            "search_budget": 4,
+            "cache_images": False,
+            "cache_context": {
+                "dataset": "mpdd",
+                "categories": ["bracket_black"],
+                "data_root": "/mpdd",
+                "checkpoint_path": "/ckpt/mpdd.pth",
+                "backbone": "dinov2reg_vit_base_14",
+            },
+        },
+    )
+    save_torch_payload(
+        enhancer_path,
+        {
+            "state_dict": {},
+            "input_dim": 3,
+            "hidden_dim": 8,
+            "epochs": 1,
+            "cache_context": {
+                "dataset": "mpdd",
+                "categories": ["bracket_black"],
+                "data_root": "/mpdd",
+                "checkpoint_path": "/ckpt/mpdd.pth",
+                "backbone": "dinov2reg_vit_base_14",
+            },
+        },
+    )
+
+    expected = {
+        "dataset": "mvtec",
+        "categories": ["bottle"],
+        "data_root": "/mvtec",
+        "checkpoint_path": "/ckpt/mvtec.pth",
+        "backbone": "dinov2reg_vit_base_14",
+    }
+    hard_summary = _try_summarize_hard_cache(
+        cache_path,
+        target_samples=1,
+        search_budget=4,
+        cache_images=False,
+        cache_context=expected,
+    )
+    enhancer_summary = _try_summarize_enhancer_checkpoint(enhancer_path, cache_context=expected)
+
+    assert hard_summary is None
+    assert enhancer_summary is None
 
 
 def test_server_pipeline_eval_stage_writes_metrics(tmp_path, monkeypatch):
@@ -265,6 +548,7 @@ def test_server_pipeline_enhanced_eval_requires_saved_calibration(tmp_path, monk
             "hidden_dim": 4,
             "epochs": 1,
             "losses": [0.1],
+            "cache_context": _expected_cache_context(data_root, checkpoint),
         },
     )
 
@@ -306,6 +590,7 @@ def test_server_pipeline_all_stage_writes_training_evaluation_metrics(tmp_path, 
             "num_candidates": 1,
             "search_budget": 4,
             "cache_images": False,
+            "cache_context": _expected_cache_context(data_root, checkpoint),
         },
     )
 
@@ -330,6 +615,7 @@ def test_server_pipeline_all_stage_writes_training_evaluation_metrics(tmp_path, 
                 "epochs": 1,
                 "losses": [0.123],
                 "fusion_calibration": fusion_calibration,
+                "cache_context": _expected_cache_context(data_root, checkpoint),
             },
         )
         return {
@@ -408,6 +694,7 @@ def test_server_pipeline_reused_real_enhancer_writes_final_enhanced_eval(tmp_pat
             "num_candidates": 1,
             "search_budget": 4,
             "cache_images": False,
+            "cache_context": _expected_cache_context(data_root, checkpoint),
         },
     )
     head = MapFeatureHead(input_dim=18, hidden_dim=4)
@@ -423,6 +710,7 @@ def test_server_pipeline_reused_real_enhancer_writes_final_enhanced_eval(tmp_pat
                 "base": {"lo": 0.0, "hi": 1.0},
                 "aux": {"lo": 0.0, "hi": 1.0},
             },
+            "cache_context": _expected_cache_context(data_root, checkpoint),
         },
     )
 
@@ -473,6 +761,7 @@ def test_server_pipeline_retrains_legacy_enhancer_missing_calibration(tmp_path, 
             "num_candidates": 1,
             "search_budget": 4,
             "cache_images": False,
+            "cache_context": _expected_cache_context(data_root, checkpoint),
         },
     )
     head = MapFeatureHead(input_dim=18, hidden_dim=4)
@@ -482,8 +771,9 @@ def test_server_pipeline_retrains_legacy_enhancer_missing_calibration(tmp_path, 
             "state_dict": head.state_dict(),
             "input_dim": 18,
             "hidden_dim": 4,
-            "epochs": 1,
-            "losses": [0.2],
+                "epochs": 1,
+                "losses": [0.2],
+                "cache_context": _expected_cache_context(data_root, checkpoint),
         },
     )
 
@@ -505,6 +795,7 @@ def test_server_pipeline_retrains_legacy_enhancer_missing_calibration(tmp_path, 
                 "epochs": 1,
                 "losses": [0.1],
                 "fusion_calibration": fusion_calibration,
+                "cache_context": _expected_cache_context(data_root, checkpoint),
             },
         )
         return {
@@ -604,6 +895,24 @@ def _fake_mvtec(root: Path, *, count: int = 1) -> Path:
     return root
 
 
+def _fake_mpdd(root: Path, *, count: int = 1) -> Path:
+    for category in ("bracket_black", "bracket_brown"):
+        good_dir = root / category / "train" / "good"
+        test_good_dir = root / category / "test" / "good"
+        defect_dir = root / category / "test" / "anomaly"
+        mask_dir = root / category / "ground_truth" / "anomaly"
+        good_dir.mkdir(parents=True)
+        test_good_dir.mkdir(parents=True)
+        defect_dir.mkdir(parents=True)
+        mask_dir.mkdir(parents=True)
+        for idx in range(count):
+            Image.new("RGB", (8 + idx, 8 + idx)).save(good_dir / f"{idx:03d}.JPG")
+        Image.new("RGB", (8, 8)).save(test_good_dir / "000.JPG")
+        Image.new("RGB", (8, 8), color=(255, 255, 255)).save(defect_dir / "001.JPG")
+        Image.new("L", (8, 8), color=255).save(mask_dir / "001.png")
+    return root
+
+
 def _fake_mvtec_test(root: Path) -> Path:
     good_dir = root / "bottle" / "test" / "good"
     defect_dir = root / "bottle" / "test" / "broken_large"
@@ -615,6 +924,16 @@ def _fake_mvtec_test(root: Path) -> Path:
     Image.new("RGB", (8, 8), color=(255, 255, 255)).save(defect_dir / "001.png")
     Image.new("L", (8, 8), color=255).save(mask_dir / "001_mask.png")
     return root
+
+
+def _expected_cache_context(data_root: Path, checkpoint: Path, *, categories=None):
+    return {
+        "dataset": "mvtec",
+        "categories": list(categories or ["bottle"]),
+        "data_root": str(data_root),
+        "checkpoint_path": str(checkpoint),
+        "backbone": "dinov2reg_vit_base_14",
+    }
 
 
 def _dummy_wrapper() -> DinomalyWrapper:

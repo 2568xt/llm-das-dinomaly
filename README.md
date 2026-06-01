@@ -74,12 +74,21 @@ bash scripts/run_server_mvtec.sh
 
 Optional environment overrides:
 
+- `DATASET`: defaults to `mvtec` for the MVTec runner and `mpdd` for the MPDD
+  runner.
 - `DINOMALY_ROOT`: defaults to `third_party/Dinomaly`.
 - `DEVICE`: defaults to `cuda`.
 - `MVTEC_CATEGORY`: defaults to `bottle` in smoke mode.
+- `MPDD_CATEGORY`: defaults to `bracket_black` in MPDD smoke mode.
 - `RUN_MODE`: defaults to `smoke`.
 - `BATCH_SIZE`: defaults to `16`, matching the official Dinomaly runner's
   batch size for the main server pipeline.
+- `BASE_TRAIN_IF_MISSING`: defaults to `false` for MVTec and `true` for MPDD.
+- `BASE_FORCE_RETRAIN`: defaults to `false`; set to `true` with an empty
+  `CHECKPOINT_PATH` to rebuild the unified base checkpoint.
+- `BASE_TOTAL_ITERS`: defaults to `10000` for MPDD base training.
+- `BASE_EVAL_INTERVAL`: defaults to `5000` for MPDD base training.
+- `BASE_CHECKPOINT_DIR`: defaults to `OUTPUT_ROOT/base_checkpoints`.
 - `MAX_SAMPLES`: defaults to `4`; use `all` for a full run.
 - `SEARCH_BUDGET`: defaults to `4`.
 - `HARD_SAMPLE_SHARD_SIZE`: defaults to `32`; hard samples are saved every
@@ -90,6 +99,8 @@ Optional environment overrides:
   rebuild the hard-sample cache.
 - `RETRAIN_ENHANCER`: defaults to `false`; set to `true` to retrain even when
   `enhancer.pt` already exists.
+- `ENHANCER_EPOCHS`, `ENHANCER_HIDDEN_DIM`, and `ENHANCER_LR`: override the
+  lightweight enhancer training defaults.
 - `PROGRESS`: defaults to `true`; set to `false` to disable terminal progress bars.
 - `EVAL_ENABLED`: defaults to `true`; set to `false` for train-only smoke runs
   when the data root does not include MVTec `test/` and `ground_truth/`.
@@ -109,7 +120,9 @@ evaluation metrics under `OUTPUT_ROOT`. Hard sample shards are saved under
 `OUTPUT_ROOT/hard_samples_shards/`. By default, `hard_samples.pt` is compact and
 contains only the tensors needed for enhancer training; image, mask, and map
 tensors are stored only when `CACHE_IMAGES=true`. Existing valid caches and
-enhancer checkpoints are reused on the next run. If a previous run left an
+enhancer checkpoints are reused on the next run only when their dataset,
+categories, data root, backbone, and base checkpoint metadata match the current
+run. If a previous run left an
 unreadable cache file, the runner moves it aside with a `.corrupt` suffix and
 rebuilds from any compatible shards that are present.
 
@@ -156,6 +169,42 @@ root must include MVTec `test/` and `ground_truth/`; set `EVAL_ENABLED=false`
 for train-only smoke runs. Per-epoch enhancer evaluation is image-level by
 default; set `EVAL_EPOCH_PIXEL_METRICS=true` only when the extra pixel-metric
 cost is intentional.
+
+## Server MPDD Run
+
+MPDD is expected to be already arranged in the same layout style as MVTec:
+`<category>/train/good`, `<category>/test/*`, and
+`<category>/ground_truth/*`. The supported MPDD categories are
+`bracket_black`, `bracket_brown`, `bracket_white`, `connector`, `metal_plate`,
+and `tubes`.
+
+Prepare a server-local env file:
+
+```bash
+cp configs/server_paths_mpdd.example.env configs/server_paths_mpdd.env
+# Edit DATA_ROOT, OUTPUT_ROOT, DEVICE, and optional CHECKPOINT_PATH.
+```
+
+If `CHECKPOINT_PATH` is empty, the MPDD runner first looks under
+`BASE_CHECKPOINT_DIR` and `checkpoints/` for an MPDD unified checkpoint. If none
+is found and `BASE_TRAIN_IF_MISSING=true`, it trains a unified Dinomaly-B
+checkpoint with the MPDD classes before generating hard samples and training the
+enhancer.
+
+Recommended full MPDD run:
+
+```bash
+RUN_MODE=full MAX_SAMPLES=all SEARCH_BUDGET=24 EVAL_BATCH_SIZE=32 \
+EVAL_PIXEL_AUPRO=false BASE_TRAIN_IF_MISSING=true \
+bash scripts/run_server_mpdd.sh configs/server_mpdd.yaml configs/server_paths_mpdd.env
+```
+
+For quick path validation:
+
+```bash
+RUN_MODE=smoke EVAL_LIMIT_PER_CATEGORY=8 EVAL_PIXEL_METRICS=false \
+bash scripts/run_server_mpdd.sh configs/server_mpdd.yaml configs/server_paths_mpdd.env
+```
 
 ## Integration Notes
 

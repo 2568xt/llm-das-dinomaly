@@ -36,10 +36,11 @@ def evaluate_mvtec_detector(
     show_progress: bool = True,
     progress_label: str = "mvtec eval",
     progress_path: Optional[Path] = None,
+    test_dataset_cls=MVTecTestDataset,
 ) -> Dict[str, Any]:
     category_summaries: Dict[str, Any] = {}
     for category in categories:
-        dataset = MVTecTestDataset(
+        dataset = test_dataset_cls(
             data_root,
             categories=[category],
             limit_per_category=limit_per_category,
