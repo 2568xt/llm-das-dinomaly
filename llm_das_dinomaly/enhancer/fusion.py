@@ -23,10 +23,17 @@ class ScoreNormalizer:
     def transform(self, scores: Tensor) -> Tensor:
         if self.lo is None or self.hi is None:
             raise RuntimeError("ScoreNormalizer must be fit before transform")
-        return (scores - self.lo) / (self.hi - self.lo + self.eps)
+        scale = self.hi - self.lo
+        if abs(scale) < self.eps:
+            scale = self.eps
+        return (scores - self.lo) / scale
 
     def fit_transform(self, scores: Tensor) -> Tensor:
         return self.fit(scores).transform(scores)
+
+
+def normalizer_from_metadata(metadata: dict) -> ScoreNormalizer:
+    return ScoreNormalizer(lo=float(metadata["lo"]), hi=float(metadata["hi"]))
 
 
 def fuse_scores(

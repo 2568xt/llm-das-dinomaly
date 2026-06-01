@@ -29,3 +29,10 @@ enhancer:
   hidden_dim: 128
   lr: 0.001
   retrain: ${RETRAIN_ENHANCER:-false}
+
+evaluation:
+  enabled: ${EVAL_ENABLED:-true}
+  batch_size: ${EVAL_BATCH_SIZE:-2}
+  resize_mask: ${EVAL_RESIZE_MASK:-256}
+  limit_per_category: ${EVAL_LIMIT_PER_CATEGORY:-all}
+  beta: ${EVAL_FUSION_BETA:-1.0}

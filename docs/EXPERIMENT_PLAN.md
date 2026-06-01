@@ -26,3 +26,10 @@ Use at least three seeds for final claims. Report mean and standard deviation
 per dataset, plus paired class-level tests or bootstrap confidence intervals.
 Keep synthetic sample visualizations with the numeric logs so that overly easy
 or unrealistic synthetic defects can be rejected early.
+
+Keep `OUTPUT_ROOT/metrics/baseline_eval.json`,
+`OUTPUT_ROOT/metrics/enhancer_epochs.jsonl`, and
+`OUTPUT_ROOT/metrics/final_enhanced_eval.json` with the server logs. The JSONL
+file records per-epoch enhancer evaluation and proves that the enhanced
+image-level score was evaluated against the original MVTec test split during
+training.
