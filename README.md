@@ -87,14 +87,33 @@ Optional environment overrides:
 - `RETRAIN_ENHANCER`: defaults to `false`; set to `true` to retrain even when
   `enhancer.pt` already exists.
 - `PROGRESS`: defaults to `true`; set to `false` to disable terminal progress bars.
+- `EVAL_ENABLED`: defaults to `true`; set to `false` for train-only smoke runs
+  when the data root does not include MVTec `test/` and `ground_truth/`.
 
-The run writes `hard_samples.pt`, `enhancer.pt`, and `run_summary.json` under
-`OUTPUT_ROOT`. It also writes incremental shards under
+The run writes `hard_samples.pt`, `enhancer.pt`, `run_summary.json`, and
+evaluation metrics under `OUTPUT_ROOT`. Hard sample shards are saved under
 `OUTPUT_ROOT/hard_samples_shards/`. By default, `hard_samples.pt` is compact and
-contains only the tensors needed for enhancer training; existing valid caches
-and enhancer checkpoints are reused on the next run. If a previous run left an
+contains only the tensors needed for enhancer training; image, mask, and map
+tensors are stored only when `CACHE_IMAGES=true`. Existing valid caches and
+enhancer checkpoints are reused on the next run. If a previous run left an
 unreadable cache file, the runner moves it aside with a `.corrupt` suffix and
 rebuilds from any compatible shards that are present.
+
+Metrics are written under `OUTPUT_ROOT/metrics/`, including
+`baseline_eval.json`, `enhancer_epochs.jsonl`, per-epoch files such as
+`enhancer_epoch_0001.json`, and `final_enhanced_eval.json`. Eval-only runs write
+`eval_summary.json` and, when an enhancer checkpoint exists,
+`eval_enhanced.json`:
+
+```bash
+python -m llm_das_dinomaly.pipelines.server_mvtec --config configs/server_mvtec.yaml --stage eval
+```
+
+The enhancer changes image-level scores only. Pixel metrics continue to come
+from the base Dinomaly anomaly map and are labeled `base_dinomaly_map` in
+enhanced summaries. Because `EVAL_ENABLED` defaults to `true`, the server data
+root must include MVTec `test/` and `ground_truth/`; set `EVAL_ENABLED=false`
+for train-only smoke runs.
 
 ## Integration Notes
 
