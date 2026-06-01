@@ -201,6 +201,12 @@ def run_pipeline(cfg: Dict[str, Any], *, stage: str = "all") -> Dict[str, Any]:
         enhancer_summary = None
         if enhancer_path.is_file() and not retrain_enhancer:
             enhancer_summary = _try_summarize_enhancer_checkpoint(enhancer_path)
+            if eval_enabled and enhancer_summary is not None and "fusion_calibration" not in enhancer_summary:
+                _warn(
+                    "existing enhancer checkpoint is missing fusion_calibration; "
+                    "retraining enhancer for enhanced evaluation"
+                )
+                enhancer_summary = None
         if eval_enabled:
             summary.setdefault("evaluation", {})["baseline"] = _run_and_write_evaluation(
                 get_wrapper(),
