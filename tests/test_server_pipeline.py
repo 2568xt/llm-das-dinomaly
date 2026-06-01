@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from PIL import Image
 
 from llm_das_dinomaly.data import MVTecGoodDataset, load_tensor_cache, save_tensor_cache, save_torch_payload
-from llm_das_dinomaly.pipelines.server_mvtec import generate_hard_samples, run_pipeline
+from llm_das_dinomaly.pipelines.server_mvtec import generate_hard_samples, run_pipeline, train_enhancer_from_cache
 from llm_das_dinomaly.wrappers import DinomalyConfig, DinomalyWrapper
 
 
@@ -177,7 +177,17 @@ def test_server_pipeline_reuses_existing_cache_and_enhancer(tmp_path, monkeypatc
     )
     save_torch_payload(
         output_root / "enhancer.pt",
-        {"state_dict": {}, "input_dim": 3, "hidden_dim": 8, "epochs": 1, "losses": [0.2]},
+        {
+            "state_dict": {},
+            "input_dim": 3,
+            "hidden_dim": 8,
+            "epochs": 1,
+            "losses": [0.2],
+            "fusion_calibration": {
+                "base": {"lo": 0.1, "hi": 0.2},
+                "aux": {"lo": 0.3, "hi": 0.4},
+            },
+        },
     )
 
     def fail_build_wrapper(**kwargs):
@@ -197,7 +207,68 @@ def test_server_pipeline_reuses_existing_cache_and_enhancer(tmp_path, monkeypatc
 
     assert summary["hard_samples"]["reused"] is True
     assert summary["enhancer"]["reused"] is True
+    assert summary["enhancer"]["fusion_calibration"]["base"] == {"lo": 0.1, "hi": 0.2}
     assert "wrapper" not in summary
+
+
+def test_train_enhancer_records_epoch_eval_callback(tmp_path):
+    cache_path = tmp_path / "hard_samples.pt"
+    save_tensor_cache(
+        cache_path,
+        {
+            "enhancer_features": torch.randn(4, 3),
+            "labels": torch.tensor([0.0, 1.0, 0.0, 1.0]),
+            "base_scores": torch.tensor([[0.1], [0.8], [0.2], [0.9]]),
+        },
+        {"type": "hard_samples"},
+    )
+    calls = []
+
+    def eval_callback(*, head, epoch, loss, fusion_calibration):
+        calls.append((head, epoch, loss, fusion_calibration["base"]))
+        return {"epoch": epoch, "mean": {"enhanced": {"image_auroc": 1.0}}}
+
+    summary = train_enhancer_from_cache(
+        cache_path,
+        tmp_path / "enhancer.pt",
+        epochs=2,
+        hidden_dim=4,
+        lr=1e-3,
+        seed=3,
+        show_progress=False,
+        eval_callback=eval_callback,
+    )
+
+    assert [call[1] for call in calls] == [1, 2]
+    assert len(summary["epoch_evaluations"]) == 2
+    assert isinstance(summary["fused_score_mean"], float)
+    assert torch.isfinite(torch.tensor(summary["fused_score_mean"]))
+    payload = torch.load(tmp_path / "enhancer.pt", map_location="cpu")
+    assert "fusion_calibration" in payload
+
+
+def test_train_enhancer_rejects_mismatched_cache_lengths(tmp_path):
+    cache_path = tmp_path / "hard_samples.pt"
+    save_tensor_cache(
+        cache_path,
+        {
+            "enhancer_features": torch.randn(4, 3),
+            "labels": torch.tensor([0.0, 1.0, 0.0, 1.0]),
+            "base_scores": torch.tensor([0.1, 0.8, 0.2]),
+        },
+        {"type": "hard_samples"},
+    )
+
+    with pytest.raises(ValueError, match="enhancer cache tensor counts must align"):
+        train_enhancer_from_cache(
+            cache_path,
+            tmp_path / "enhancer.pt",
+            epochs=1,
+            hidden_dim=4,
+            lr=1e-3,
+            seed=3,
+            show_progress=False,
+        )
 
 
 def _fake_mvtec(root: Path, *, count: int = 1) -> Path:

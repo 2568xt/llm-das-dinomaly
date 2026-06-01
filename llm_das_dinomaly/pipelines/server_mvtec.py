@@ -11,7 +11,7 @@ import torch
 
 from llm_das_dinomaly.data.mvtec import MVTEC_CLASSES
 from llm_das_dinomaly.data import MVTecGoodDataset, load_tensor_cache, save_tensor_cache, save_torch_payload
-from llm_das_dinomaly.enhancer import MapFeatureHead, build_enhancer_features, fuse_scores
+from llm_das_dinomaly.enhancer import MapFeatureHead, ScoreNormalizer, build_enhancer_features, fuse_scores
 from llm_das_dinomaly.enhancer.heads import binary_enhancer_loss
 from llm_das_dinomaly.integrations import build_dinomaly_wrapper
 from llm_das_dinomaly.search import NormalScoreStats, SearchConfig, score_aware_search
@@ -301,28 +301,54 @@ def train_enhancer_from_cache(
     lr: float,
     seed: int,
     show_progress: bool = True,
+    eval_callback=None,
 ) -> Dict[str, Any]:
     seed_everything(seed)
     payload = load_tensor_cache(cache_path)
     x = payload["tensors"]["enhancer_features"].float()
-    labels = payload["tensors"]["labels"].float()
+    labels = payload["tensors"]["labels"].float().reshape(-1)
+    base_scores = payload["tensors"]["base_scores"].float().reshape(-1)
+    if x.shape[0] != labels.numel() or x.shape[0] != base_scores.numel():
+        raise ValueError(
+            "enhancer cache tensor counts must align: "
+            f"features={x.shape[0]}, labels={labels.numel()}, base_scores={base_scores.numel()}"
+        )
     head = MapFeatureHead(input_dim=x.shape[1], hidden_dim=hidden_dim)
     opt = torch.optim.AdamW(head.parameters(), lr=lr)
     losses = []
+    epoch_evaluations = []
     progress = ProgressBar(epochs, label="enhancer training", enabled=show_progress)
-    for _ in range(epochs):
+    for epoch_idx in range(epochs):
         logits = head(x)
         loss = binary_enhancer_loss(logits, labels)
         opt.zero_grad()
         loss.backward()
         opt.step()
         losses.append(float(loss.item()))
+        with torch.no_grad():
+            aux_scores = torch.sigmoid(head(x)).reshape(-1)
+            fusion_calibration = _fit_fusion_calibration(base_scores, aux_scores)
+        if eval_callback is not None:
+            epoch_evaluations.append(
+                eval_callback(
+                    head=head,
+                    epoch=epoch_idx + 1,
+                    loss=losses[-1],
+                    fusion_calibration=fusion_calibration,
+                )
+            )
         progress.update(suffix=f"loss={losses[-1]:.6f}")
     progress.close()
 
     with torch.no_grad():
-        aux = torch.sigmoid(head(x))
-        fused = fuse_scores(payload["tensors"]["base_scores"].float(), aux)
+        aux = torch.sigmoid(head(x)).reshape(-1)
+        final_calibration = _fit_fusion_calibration(base_scores, aux)
+        fused = fuse_scores(
+            base_scores,
+            aux,
+            base_normalizer=ScoreNormalizer(**final_calibration["base"]),
+            aux_normalizer=ScoreNormalizer(**final_calibration["aux"]),
+        )
     save_torch_payload(
         output_path,
         {
@@ -331,16 +357,21 @@ def train_enhancer_from_cache(
             "hidden_dim": hidden_dim,
             "epochs": epochs,
             "losses": losses,
+            "fusion_calibration": final_calibration,
         },
     )
-    return {
+    summary = {
         "checkpoint_path": str(output_path),
         "reused": False,
         "input_dim": int(x.shape[1]),
         "epochs": epochs,
         "final_loss": losses[-1],
         "fused_score_mean": float(fused.mean().item()),
+        "fusion_calibration": final_calibration,
     }
+    if epoch_evaluations:
+        summary["epoch_evaluations"] = epoch_evaluations
+    return summary
 
 
 def _iter_dataset_batches(
@@ -646,10 +677,21 @@ def _try_summarize_enhancer_checkpoint(path: Path) -> Optional[Dict[str, Any]]:
         }
         if losses:
             summary["final_loss"] = float(losses[-1])
+        if "fusion_calibration" in payload:
+            summary["fusion_calibration"] = payload["fusion_calibration"]
         return summary
     except Exception as exc:
         _quarantine_unreadable_file(path, "enhancer checkpoint", exc)
         return None
+
+
+def _fit_fusion_calibration(base_scores: torch.Tensor, aux_scores: torch.Tensor) -> Dict[str, Dict[str, float]]:
+    base = ScoreNormalizer().fit(base_scores.reshape(-1))
+    aux = ScoreNormalizer().fit(aux_scores.reshape(-1))
+    return {
+        "base": {"lo": float(base.lo), "hi": float(base.hi)},
+        "aux": {"lo": float(aux.lo), "hi": float(aux.hi)},
+    }
 
 
 def _clear_hard_sample_artifacts(cache_path: Path) -> None:
