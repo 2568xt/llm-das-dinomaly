@@ -11,6 +11,7 @@ from PIL import Image
 from llm_das_dinomaly.data import MVTecGoodDataset, load_tensor_cache, save_tensor_cache, save_torch_payload
 from llm_das_dinomaly.enhancer import MapFeatureHead
 from llm_das_dinomaly.pipelines.server_mvtec import (
+    _initialize_trainable_layers_then_move,
     _maybe_disable_legacy_cuda_fusers,
     _try_summarize_enhancer_checkpoint,
     _try_summarize_hard_cache,
@@ -75,6 +76,29 @@ def test_cuda_compat_helper_disables_available_legacy_fusers(monkeypatch):
         ("profiling_mode", False),
         ("gpu_fusion", False),
     ]
+
+
+def test_base_training_initializes_layers_before_device_move(monkeypatch):
+    calls = []
+
+    class TrackingModel(nn.Module):
+        def to(self, device):
+            calls.append(("to", device))
+            return self
+
+    def fake_init(model, trunc_normal):
+        calls.append(("init", model, trunc_normal))
+
+    def fake_trunc_normal():
+        raise AssertionError("not called directly by this helper")
+
+    monkeypatch.setattr("llm_das_dinomaly.pipelines.server_mvtec._init_trainable_layers", fake_init)
+    model = TrackingModel()
+
+    returned = _initialize_trainable_layers_then_move(model, fake_trunc_normal, "cuda:4")
+
+    assert returned is model
+    assert calls == [("init", model, fake_trunc_normal), ("to", "cuda:4")]
 
 
 def test_server_pipeline_check_stage_with_fake_mvtec(tmp_path):
