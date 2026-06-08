@@ -1,10 +1,10 @@
 runtime:
   mode: ${RUN_MODE:-smoke}
-  dataset: ${DATASET:-mpdd}
+  dataset: ${DATASET:-visa}
   device: ${DEVICE:-cuda}
   seed: 7
   batch_size: ${BATCH_SIZE:-16}
-  output_root: ${OUTPUT_ROOT:-outputs/server_mpdd}
+  output_root: ${OUTPUT_ROOT:-outputs/server_visa}
   progress: ${PROGRESS:-true}
 
 model:
@@ -14,10 +14,10 @@ model:
   strict_checkpoint: false
 
 data:
-  dataset: ${DATASET:-mpdd}
+  dataset: ${DATASET:-visa}
   root: ${DATA_ROOT:-}
   few_shot_root: ${FEW_SHOT_ROOT:-}
-  categories: ["${MPDD_CATEGORY:-bracket_black}"]
+  categories: ["${VISA_CATEGORY:-candle}"]
   limit_per_category: 4
 
 base_training:

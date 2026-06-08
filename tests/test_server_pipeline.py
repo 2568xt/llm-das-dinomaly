@@ -125,6 +125,77 @@ def test_mpdd_full_mode_expands_default_category_to_all_mpdd_classes(tmp_path):
     ]
 
 
+def test_visa_full_mode_expands_default_category_to_all_visa_classes(tmp_path):
+    data_root = _fake_visa(tmp_path / "visa")
+    checkpoint = tmp_path / "model.pth"
+    checkpoint.write_bytes(b"not-used-in-check-stage")
+    dinomaly_root = tmp_path / "Dinomaly"
+    (dinomaly_root / "models").mkdir(parents=True)
+    (dinomaly_root / "models" / "uad.py").write_text("# fake\n", encoding="utf-8")
+
+    summary = run_pipeline(
+        {
+            "runtime": {"mode": "full", "output_root": str(tmp_path / "out"), "device": "cpu"},
+            "data": {
+                "dataset": "visa",
+                "root": str(data_root),
+                "categories": ["candle"],
+                "limit_per_category": 1,
+            },
+            "model": {"dinomaly_root": str(dinomaly_root), "checkpoint_path": str(checkpoint)},
+        },
+        stage="check",
+    )
+
+    assert summary["dataset"] == "visa"
+    assert summary["categories"] == [
+        "candle",
+        "capsules",
+        "cashew",
+        "chewinggum",
+        "fryum",
+        "macaroni1",
+        "macaroni2",
+        "pcb1",
+        "pcb2",
+        "pcb3",
+        "pcb4",
+        "pipe_fryum",
+    ]
+
+
+def test_few_shot_root_replaces_data_root_and_adds_rotation_views(tmp_path):
+    few_shot_root = _fake_mvtec(tmp_path / "fewshot", count=2)
+    checkpoint = tmp_path / "old.pth"
+    checkpoint.write_bytes(b"ignored-in-check-stage")
+    dinomaly_root = tmp_path / "Dinomaly"
+    (dinomaly_root / "models").mkdir(parents=True)
+    (dinomaly_root / "models" / "uad.py").write_text("# fake\n", encoding="utf-8")
+
+    summary = run_pipeline(
+        {
+            "runtime": {"output_root": str(tmp_path / "out"), "device": "cpu", "progress": False},
+            "data": {
+                "root": str(tmp_path / "missing-full-root"),
+                "few_shot_root": str(few_shot_root),
+                "categories": ["bottle"],
+                "limit_per_category": 1,
+            },
+            "model": {"dinomaly_root": str(dinomaly_root), "checkpoint_path": str(checkpoint)},
+        },
+        stage="check",
+    )
+
+    assert summary["data_root"] == str(few_shot_root)
+    assert summary["configured_data_root"] == str(tmp_path / "missing-full-root")
+    assert summary["few_shot"]["active"] is True
+    assert summary["few_shot"]["rotation_angles"] == [0, 90, 180, 270]
+    assert summary["num_base_normal_images"] == 2
+    assert summary["num_normal_images"] == 8
+    assert summary["checkpoint_path"] is None
+    assert summary["base_checkpoint"]["source"] == "few_shot_will_train"
+
+
 def test_mpdd_check_stage_allows_missing_checkpoint_when_training_enabled(tmp_path):
     data_root = _fake_mpdd(tmp_path / "mpdd")
     dinomaly_root = tmp_path / "Dinomaly"
@@ -238,6 +309,8 @@ def test_all_stage_trains_missing_mpdd_base_before_reusing_matching_artifacts(tm
         "data_root": str(data_root),
         "checkpoint_path": str(checkpoint),
         "backbone": "dinov2reg_vit_base_14",
+        "few_shot": False,
+        "rotation_angles": [],
     }
     save_tensor_cache(
         output_root / "hard_samples.pt",
@@ -302,6 +375,58 @@ def test_all_stage_trains_missing_mpdd_base_before_reusing_matching_artifacts(tm
     assert summary["base_checkpoint"]["source"] == "trained"
     assert summary["hard_samples"]["reused"] is True
     assert summary["enhancer"]["reused"] is True
+
+
+def test_few_shot_all_stage_trains_new_base_and_generates_rotated_hard_samples(tmp_path, monkeypatch):
+    data_root = _fake_mvtec(tmp_path / "full", count=1)
+    few_shot_root = _fake_mvtec(tmp_path / "fewshot", count=2)
+    old_checkpoint = tmp_path / "old.pth"
+    old_checkpoint.write_bytes(b"ignored")
+    dinomaly_root = tmp_path / "Dinomaly"
+    (dinomaly_root / "models").mkdir(parents=True)
+    (dinomaly_root / "models" / "uad.py").write_text("# fake\n", encoding="utf-8")
+    calls = []
+
+    def fake_base_train(**kwargs):
+        calls.append(kwargs)
+        Path(kwargs["output_path"]).parent.mkdir(parents=True, exist_ok=True)
+        Path(kwargs["output_path"]).write_bytes(b"few-shot-trained")
+        return {"checkpoint_path": str(kwargs["output_path"]), "trained": True}
+
+    def build_dummy_wrapper(**kwargs):
+        return _dummy_wrapper(), {"backend": "dummy"}
+
+    monkeypatch.setattr("llm_das_dinomaly.pipelines.server_mvtec.train_unified_dinomaly_checkpoint", fake_base_train)
+    monkeypatch.setattr("llm_das_dinomaly.pipelines.server_mvtec.build_dinomaly_wrapper", build_dummy_wrapper)
+    summary = run_pipeline(
+        {
+            "runtime": {"output_root": str(tmp_path / "out"), "device": "cpu", "progress": False, "batch_size": 4},
+            "data": {
+                "root": str(data_root),
+                "few_shot_root": str(few_shot_root),
+                "categories": ["bottle"],
+                "limit_per_category": 1,
+            },
+            "model": {"dinomaly_root": str(dinomaly_root), "checkpoint_path": str(old_checkpoint)},
+            "base_training": {"checkpoint_dir": str(tmp_path / "base"), "total_iters": 10},
+            "hard_samples": {"search_budget": 1, "max_samples": 1, "shard_size": 4},
+            "enhancer": {"epochs": 1, "hidden_dim": 4},
+            "evaluation": {"enabled": False},
+        },
+        stage="all",
+    )
+
+    assert calls
+    assert calls[0]["data_root"] == few_shot_root
+    assert summary["base_checkpoint"]["source"] == "few_shot_trained"
+    assert summary["base_checkpoint"]["ignored_checkpoint_path"] == str(old_checkpoint)
+    assert summary["hard_samples"]["num_candidates"] == 8
+    assert summary["hard_samples"]["reused"] is False
+    payload = load_tensor_cache(tmp_path / "out" / "hard_samples.pt")
+    rotations = [record["rotation_degrees"] for record in payload["metadata"]["source_records"]]
+    assert rotations == [0, 90, 180, 270, 0, 90, 180, 270]
+    assert payload["metadata"]["cache_context"]["few_shot"] is True
+    assert payload["metadata"]["cache_context"]["rotation_angles"] == [0, 90, 180, 270]
 
 
 def test_hard_sample_generation_writes_compact_shards_by_default(tmp_path):
@@ -456,6 +581,8 @@ def test_cache_context_mismatch_rejects_hard_cache_and_enhancer(tmp_path):
                 "data_root": "/mpdd",
                 "checkpoint_path": "/ckpt/mpdd.pth",
                 "backbone": "dinov2reg_vit_base_14",
+                "few_shot": False,
+                "rotation_angles": [],
             },
         },
     )
@@ -472,6 +599,8 @@ def test_cache_context_mismatch_rejects_hard_cache_and_enhancer(tmp_path):
                 "data_root": "/mpdd",
                 "checkpoint_path": "/ckpt/mpdd.pth",
                 "backbone": "dinov2reg_vit_base_14",
+                "few_shot": False,
+                "rotation_angles": [],
             },
         },
     )
@@ -482,6 +611,8 @@ def test_cache_context_mismatch_rejects_hard_cache_and_enhancer(tmp_path):
         "data_root": "/mvtec",
         "checkpoint_path": "/ckpt/mvtec.pth",
         "backbone": "dinov2reg_vit_base_14",
+        "few_shot": False,
+        "rotation_angles": [],
     }
     hard_summary = _try_summarize_hard_cache(
         cache_path,
@@ -913,6 +1044,37 @@ def _fake_mpdd(root: Path, *, count: int = 1) -> Path:
     return root
 
 
+def _fake_visa(root: Path, *, count: int = 1) -> Path:
+    for category in (
+        "candle",
+        "capsules",
+        "cashew",
+        "chewinggum",
+        "fryum",
+        "macaroni1",
+        "macaroni2",
+        "pcb1",
+        "pcb2",
+        "pcb3",
+        "pcb4",
+        "pipe_fryum",
+    ):
+        good_dir = root / category / "train" / "good"
+        test_good_dir = root / category / "test" / "good"
+        defect_dir = root / category / "test" / "bad"
+        mask_dir = root / category / "ground_truth" / "bad"
+        good_dir.mkdir(parents=True)
+        test_good_dir.mkdir(parents=True)
+        defect_dir.mkdir(parents=True)
+        mask_dir.mkdir(parents=True)
+        for idx in range(count):
+            Image.new("RGB", (8 + idx, 8 + idx)).save(good_dir / f"{idx:03d}.JPG")
+        Image.new("RGB", (8, 8)).save(test_good_dir / "000.JPG")
+        Image.new("RGB", (8, 8), color=(255, 255, 255)).save(defect_dir / "001.JPG")
+        Image.new("L", (8, 8), color=255).save(mask_dir / "001.png")
+    return root
+
+
 def _fake_mvtec_test(root: Path) -> Path:
     good_dir = root / "bottle" / "test" / "good"
     defect_dir = root / "bottle" / "test" / "broken_large"
@@ -933,6 +1095,8 @@ def _expected_cache_context(data_root: Path, checkpoint: Path, *, categories=Non
         "data_root": str(data_root),
         "checkpoint_path": str(checkpoint),
         "backbone": "dinov2reg_vit_base_14",
+        "few_shot": False,
+        "rotation_angles": [],
     }
 
 

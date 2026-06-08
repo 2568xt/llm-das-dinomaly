@@ -6,6 +6,7 @@ ENV_FILE="${2:-${SERVER_ENV_FILE:-}}"
 OVERRIDE_CANDIDATES=(
   DATASET
   DATA_ROOT
+  FEW_SHOT_ROOT
   CHECKPOINT_PATH
   OUTPUT_ROOT
   DINOMALY_ROOT
@@ -14,6 +15,7 @@ OVERRIDE_CANDIDATES=(
   BATCH_SIZE
   MVTEC_CATEGORY
   MPDD_CATEGORY
+  VISA_CATEGORY
   BASE_TRAIN_IF_MISSING
   BASE_FORCE_RETRAIN
   BASE_TOTAL_ITERS
@@ -78,8 +80,13 @@ DATASET="${DATASET:-mvtec}"
 export RUN_MODE
 export DATASET
 
-: "${DATA_ROOT:?Set DATA_ROOT to the MVTec root, e.g. /data/mvtec_anomaly_detection}"
-: "${CHECKPOINT_PATH:?Set CHECKPOINT_PATH to a trained Dinomaly checkpoint .pth}"
+if [[ -z "${DATA_ROOT:-}" && -z "${FEW_SHOT_ROOT:-}" ]]; then
+  echo "Set DATA_ROOT to the MVTec root or FEW_SHOT_ROOT to a complete few-shot root" >&2
+  exit 2
+fi
+if [[ -z "${FEW_SHOT_ROOT:-}" ]]; then
+  : "${CHECKPOINT_PATH:?Set CHECKPOINT_PATH to a trained Dinomaly checkpoint .pth, or set FEW_SHOT_ROOT to train a new base checkpoint}"
+fi
 : "${OUTPUT_ROOT:?Set OUTPUT_ROOT to a writable output directory}"
 : "${DINOMALY_ROOT:=third_party/Dinomaly}"
 export DINOMALY_ROOT
@@ -100,8 +107,13 @@ if [[ -n "${ENV_FILE}" ]]; then
 fi
 echo "[llm-das-dinomaly] dataset=${DATASET}"
 echo "[llm-das-dinomaly] mode=${RUN_MODE}"
-echo "[llm-das-dinomaly] data=${DATA_ROOT}"
-echo "[llm-das-dinomaly] checkpoint=${CHECKPOINT_PATH}"
+echo "[llm-das-dinomaly] data=${DATA_ROOT:-<none>}"
+if [[ -n "${FEW_SHOT_ROOT:-}" ]]; then
+  echo "[llm-das-dinomaly] few_shot_root=${FEW_SHOT_ROOT}"
+  echo "[llm-das-dinomaly] checkpoint=<few-shot-train-new>"
+else
+  echo "[llm-das-dinomaly] checkpoint=${CHECKPOINT_PATH}"
+fi
 echo "[llm-das-dinomaly] output=${OUTPUT_ROOT}"
 echo "[llm-das-dinomaly] dinomaly=${DINOMALY_ROOT}"
 

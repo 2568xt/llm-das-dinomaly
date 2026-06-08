@@ -16,6 +16,10 @@ from llm_das_dinomaly.data import (
     MVTEC_CLASSES,
     MVTecGoodDataset,
     MVTecTestDataset,
+    RotatedGoodDataset,
+    VISA_CLASSES,
+    ViSAGoodDataset,
+    ViSATestDataset,
     load_tensor_cache,
     save_tensor_cache,
     save_torch_payload,
@@ -48,7 +52,15 @@ DATASET_SPECS = {
         "good_dataset_cls": MPDDGoodDataset,
         "test_dataset_cls": MPDDTestDataset,
     },
+    "visa": {
+        "classes": VISA_CLASSES,
+        "default_category": "candle",
+        "good_dataset_cls": ViSAGoodDataset,
+        "test_dataset_cls": ViSATestDataset,
+    },
 }
+
+FEW_SHOT_ROTATION_ANGLES = (0, 90, 180, 270)
 
 
 def main(argv: Optional[List[str]] = None) -> None:
@@ -92,7 +104,8 @@ def run_pipeline(cfg: Dict[str, Any], *, stage: str = "all") -> Dict[str, Any]:
 
     dataset_name = str(data_cfg.get("dataset", runtime.get("dataset", "mvtec"))).strip().lower()
     dataset_spec = _dataset_spec(dataset_name)
-    data_root = require_path(data_cfg["root"], kind="DATA_ROOT")
+    configured_data_root, few_shot_root, data_root = _resolve_data_roots(data_cfg)
+    few_shot_active = few_shot_root is not None
     dinomaly_root = require_path(model_cfg["dinomaly_root"], kind="DINOMALY_ROOT")
     categories = data_cfg.get("categories") or [dataset_spec["default_category"]]
     limit_per_category = data_cfg.get("limit_per_category")
@@ -105,6 +118,8 @@ def run_pipeline(cfg: Dict[str, Any], *, stage: str = "all") -> Dict[str, Any]:
         limit_per_category = None
     else:
         categories = list(categories)
+    if few_shot_active:
+        limit_per_category = None
     batch_size = int(runtime.get("batch_size", 16))
     show_progress = _as_bool(runtime.get("progress", True))
     eval_enabled = _as_bool(eval_cfg.get("enabled", True))
@@ -124,10 +139,16 @@ def run_pipeline(cfg: Dict[str, Any], *, stage: str = "all") -> Dict[str, Any]:
     eval_epoch_pixel_metrics = _as_bool(eval_cfg.get("epoch_pixel_metrics", False))
     metrics_dir = output_root / "metrics"
 
-    dataset = dataset_spec["good_dataset_cls"](
+    base_dataset = dataset_spec["good_dataset_cls"](
         data_root,
         categories=categories,
         limit_per_category=limit_per_category,
+    )
+    rotation_angles = FEW_SHOT_ROTATION_ANGLES if few_shot_active else ()
+    dataset = (
+        RotatedGoodDataset(base_dataset, angles=rotation_angles)
+        if rotation_angles
+        else base_dataset
     )
     checkpoint_path, base_summary = _resolve_base_checkpoint(
         model_cfg,
@@ -141,6 +162,7 @@ def run_pipeline(cfg: Dict[str, Any], *, stage: str = "all") -> Dict[str, Any]:
         device=device,
         seed=seed,
         show_progress=show_progress,
+        few_shot_active=few_shot_active,
     )
     summary: Dict[str, Any] = {
         "stage": stage,
@@ -149,10 +171,21 @@ def run_pipeline(cfg: Dict[str, Any], *, stage: str = "all") -> Dict[str, Any]:
         "seed": seed,
         "device": device,
         "data_root": str(data_root),
+        "configured_data_root": None if configured_data_root is None else str(configured_data_root),
+        "few_shot_root": None if few_shot_root is None else str(few_shot_root),
         "categories": categories,
         "num_normal_images": len(dataset),
+        "num_base_normal_images": len(base_dataset),
         "output_root": str(output_root),
         "checkpoint_path": None if checkpoint_path is None else str(checkpoint_path),
+        "few_shot": {
+            "active": few_shot_active,
+            "effective_data_root": str(data_root),
+            "root": None if few_shot_root is None else str(few_shot_root),
+            "rotation_angles": list(rotation_angles),
+            "base_normal_images": len(base_dataset),
+            "rotated_normal_views": len(dataset),
+        },
     }
     if base_summary:
         summary["base_checkpoint"] = base_summary
@@ -177,6 +210,8 @@ def run_pipeline(cfg: Dict[str, Any], *, stage: str = "all") -> Dict[str, Any]:
         data_root=data_root,
         checkpoint_path=checkpoint_path,
         backbone=backbone,
+        few_shot_active=few_shot_active,
+        rotation_angles=rotation_angles,
     )
 
     wrapper_pair = None
@@ -200,8 +235,13 @@ def run_pipeline(cfg: Dict[str, Any], *, stage: str = "all") -> Dict[str, Any]:
     enhancer_path = output_root / "enhancer.pt"
     regenerate_hard = _as_bool(hard_cfg.get("regenerate", False))
     retrain_enhancer = _as_bool(enhancer_cfg.get("retrain", False))
+    if few_shot_active and base_summary.get("trained"):
+        regenerate_hard = True
+        retrain_enhancer = True
     hard_search_budget = int(hard_cfg.get("search_budget", 4))
     hard_max_samples = _resolve_max_samples(hard_cfg.get("max_samples", 8), mode=mode)
+    if few_shot_active:
+        hard_max_samples = len(dataset)
     hard_target_samples = min(len(dataset), hard_max_samples)
     cache_images = _as_bool(hard_cfg.get("cache_images", False))
     hard_shard_size = int(hard_cfg.get("shard_size", 32))
@@ -395,6 +435,19 @@ def _dataset_spec(dataset_name: str) -> Dict[str, Any]:
     return DATASET_SPECS[dataset_name]
 
 
+def _resolve_data_roots(data_cfg: Dict[str, Any]) -> Tuple[Optional[Path], Optional[Path], Path]:
+    data_root_value = str(data_cfg.get("root", "") or "").strip()
+    few_shot_value = str(data_cfg.get("few_shot_root", "") or "").strip()
+    configured_data_root = Path(data_root_value).expanduser() if data_root_value else None
+    if few_shot_value:
+        few_shot_root = require_path(few_shot_value, kind="FEW_SHOT_ROOT")
+        return configured_data_root, few_shot_root, few_shot_root
+    if not data_root_value:
+        raise FileNotFoundError("DATA_ROOT is not set and FEW_SHOT_ROOT is not set")
+    data_root = require_path(data_root_value, kind="DATA_ROOT")
+    return configured_data_root, None, data_root
+
+
 def _resolve_base_checkpoint(
     model_cfg: Dict[str, Any],
     base_cfg: Dict[str, Any],
@@ -408,6 +461,7 @@ def _resolve_base_checkpoint(
     device: str,
     seed: int,
     show_progress: bool,
+    few_shot_active: bool = False,
 ) -> Tuple[Optional[Path], Dict[str, Any]]:
     backbone = str(model_cfg.get("backbone", "dinov2reg_vit_base_14"))
     explicit_checkpoint = str(model_cfg.get("checkpoint_path", "") or "").strip()
@@ -418,6 +472,68 @@ def _resolve_base_checkpoint(
     batch_size = int(base_cfg.get("batch_size", 16))
     num_workers = int(base_cfg.get("num_workers", 4))
     checkpoint_dir = Path(base_cfg.get("checkpoint_dir") or (output_root / "base_checkpoints")).expanduser()
+
+    if few_shot_active:
+        output_path = checkpoint_dir / _base_checkpoint_filename(
+            dataset_name=dataset_name,
+            backbone=backbone,
+            total_iters=total_iters,
+        )
+        should_train = stage in {"base-train", "all"}
+        if should_train:
+            training_summary = train_unified_dinomaly_checkpoint(
+                dinomaly_root=dinomaly_root,
+                data_root=data_root,
+                output_path=output_path,
+                categories=categories,
+                backbone=backbone,
+                device=device,
+                total_iters=total_iters,
+                eval_interval=eval_interval,
+                batch_size=batch_size,
+                num_workers=num_workers,
+                seed=seed,
+                show_progress=show_progress,
+            )
+            training_summary.update(
+                {
+                    "source": "few_shot_trained",
+                    "trained": True,
+                    "few_shot": True,
+                    "ignored_checkpoint_path": explicit_checkpoint or None,
+                    "checkpoint_search_skipped": True,
+                    "train_if_missing": train_if_missing,
+                    "force_retrain": True,
+                }
+            )
+            return Path(training_summary["checkpoint_path"]), training_summary
+        if output_path.is_file() and stage != "check":
+            return output_path, {
+                "source": "few_shot_run_checkpoint",
+                "checkpoint_path": str(output_path),
+                "trained": False,
+                "few_shot": True,
+                "ignored_checkpoint_path": explicit_checkpoint or None,
+                "checkpoint_search_skipped": True,
+                "train_if_missing": train_if_missing,
+                "force_retrain": False,
+            }
+        if stage == "check":
+            return None, {
+                "source": "few_shot_will_train",
+                "checkpoint_path": None,
+                "trained": False,
+                "few_shot": True,
+                "will_train": True,
+                "ignored_checkpoint_path": explicit_checkpoint or None,
+                "checkpoint_search_skipped": True,
+                "train_if_missing": train_if_missing,
+                "force_retrain": True,
+            }
+        raise FileNotFoundError(
+            "FEW_SHOT_ROOT is active but no run-local base checkpoint exists. "
+            "Run stage=base-train or stage=all first."
+        )
 
     if explicit_checkpoint:
         checkpoint = require_path(explicit_checkpoint, kind="CHECKPOINT_PATH", must_be_file=True)
@@ -758,26 +874,47 @@ def _cache_context(
     data_root: Path,
     checkpoint_path: Path,
     backbone: str,
+    few_shot_active: bool = False,
+    rotation_angles: Sequence[int] = (),
 ) -> Dict[str, Any]:
-    return {
+    context = {
         "dataset": dataset_name,
         "categories": list(categories),
         "data_root": str(Path(data_root).expanduser()),
         "checkpoint_path": str(Path(checkpoint_path).expanduser()),
         "backbone": backbone,
+        "few_shot": bool(few_shot_active),
+        "rotation_angles": [int(angle) for angle in rotation_angles],
     }
+    if few_shot_active:
+        context["checkpoint_fingerprint"] = _checkpoint_fingerprint(checkpoint_path)
+    return context
 
 
 def _normalize_cache_context(context: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if not context:
         return None
-    return {
+    normalized = {
         "dataset": str(context.get("dataset")),
         "categories": [str(category) for category in context.get("categories", [])],
         "data_root": str(context.get("data_root")),
         "checkpoint_path": str(context.get("checkpoint_path")),
         "backbone": str(context.get("backbone")),
+        "few_shot": _as_bool(context.get("few_shot", False)),
+        "rotation_angles": [int(angle) for angle in context.get("rotation_angles", [])],
     }
+    if "checkpoint_fingerprint" in context:
+        fingerprint = context.get("checkpoint_fingerprint") or {}
+        normalized["checkpoint_fingerprint"] = {
+            "size": int(fingerprint.get("size", -1)),
+            "mtime_ns": int(fingerprint.get("mtime_ns", -1)),
+        }
+    return normalized
+
+
+def _checkpoint_fingerprint(path: Path) -> Dict[str, int]:
+    stat = Path(path).expanduser().stat()
+    return {"size": int(stat.st_size), "mtime_ns": int(stat.st_mtime_ns)}
 
 
 def _cache_context_matches(existing: Any, expected: Optional[Dict[str, Any]]) -> bool:

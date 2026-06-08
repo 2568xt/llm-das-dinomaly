@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from PIL import Image
 from torch.utils.data import Dataset
@@ -187,6 +187,46 @@ class MVTecGoodDataset(Dataset):
         }
 
 
+class RotatedGoodDataset(Dataset):
+    """Expose lossless quarter-turn views of a normal-image dataset."""
+
+    def __init__(
+        self,
+        dataset: Dataset,
+        *,
+        angles: Sequence[int] = (0, 90, 180, 270),
+    ) -> None:
+        if not angles:
+            raise ValueError("rotation angles must contain at least one value")
+        normalized = []
+        for angle in angles:
+            value = int(angle) % 360
+            if value not in {0, 90, 180, 270}:
+                raise ValueError("rotation angles must be quarter turns: 0, 90, 180, 270")
+            normalized.append(value)
+        self.dataset = dataset
+        self.angles = tuple(normalized)
+
+    def __len__(self) -> int:
+        return len(self.dataset) * len(self.angles)
+
+    def __getitem__(self, idx: int):
+        if idx < 0 or idx >= len(self):
+            raise IndexError(idx)
+        source_idx = idx // len(self.angles)
+        angle = self.angles[idx % len(self.angles)]
+        image, meta = self.dataset[source_idx]
+        rotated = _rotate_quarter_turn(image, angle)
+        out_meta: Dict[str, Any] = dict(meta)
+        source_path = out_meta.get("source_path") or out_meta.get("path")
+        if source_path is not None:
+            out_meta["source_path"] = source_path
+        out_meta["rotation_degrees"] = angle
+        out_meta["source_index"] = int(source_idx)
+        out_meta["view_index"] = int(idx)
+        return rotated, out_meta
+
+
 class MVTecTestDataset(Dataset):
     def __init__(
         self,
@@ -219,3 +259,16 @@ class MVTecTestDataset(Dataset):
             "split": record.split,
             "label": record.label,
         }
+
+
+def _rotate_quarter_turn(image: Image.Image, angle: int) -> Image.Image:
+    angle = int(angle) % 360
+    if angle == 0:
+        return image.copy()
+    if angle == 90:
+        return image.transpose(Image.Transpose.ROTATE_90)
+    if angle == 180:
+        return image.transpose(Image.Transpose.ROTATE_180)
+    if angle == 270:
+        return image.transpose(Image.Transpose.ROTATE_270)
+    raise ValueError("rotation angles must be quarter turns: 0, 90, 180, 270")

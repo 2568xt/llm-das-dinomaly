@@ -23,5 +23,6 @@ dist/
 # Server-local path files. Keep examples tracked, but not real machine paths.
 /configs/server_paths.env
 /configs/server_paths_mpdd.env
+/configs/server_paths_visa.env
 /.env.server
 /.env.local

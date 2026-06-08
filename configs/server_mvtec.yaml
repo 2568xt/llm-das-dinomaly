@@ -9,13 +9,14 @@ runtime:
 
 model:
   dinomaly_root: ${DINOMALY_ROOT:-third_party/Dinomaly}
-  checkpoint_path: ${CHECKPOINT_PATH}
+  checkpoint_path: ${CHECKPOINT_PATH:-}
   backbone: dinov2reg_vit_base_14
   strict_checkpoint: false
 
 data:
   dataset: ${DATASET:-mvtec}
-  root: ${DATA_ROOT}
+  root: ${DATA_ROOT:-}
+  few_shot_root: ${FEW_SHOT_ROOT:-}
   categories: ["${MVTEC_CATEGORY:-bottle}"]
   limit_per_category: 4
 
