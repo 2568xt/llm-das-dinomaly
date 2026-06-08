@@ -122,6 +122,10 @@ def run_pipeline(cfg: Dict[str, Any], *, stage: str = "all") -> Dict[str, Any]:
         limit_per_category = None
     batch_size = int(runtime.get("batch_size", 16))
     show_progress = _as_bool(runtime.get("progress", True))
+    cuda_compat = _maybe_disable_legacy_cuda_fusers(device)
+    if show_progress and cuda_compat["disabled"]:
+        disabled = ", ".join(cuda_compat["disabled"])
+        _warn(f"disabled legacy CUDA JIT fusers for compatibility: {disabled}")
     eval_enabled = _as_bool(eval_cfg.get("enabled", True))
     eval_batch_size = int(eval_cfg.get("batch_size", batch_size))
     eval_num_workers = int(eval_cfg.get("num_workers", 0))
@@ -170,6 +174,7 @@ def run_pipeline(cfg: Dict[str, Any], *, stage: str = "all") -> Dict[str, Any]:
         "dataset": dataset_name,
         "seed": seed,
         "device": device,
+        "cuda_compat": cuda_compat,
         "data_root": str(data_root),
         "configured_data_root": None if configured_data_root is None else str(configured_data_root),
         "few_shot_root": None if few_shot_root is None else str(few_shot_root),
@@ -446,6 +451,39 @@ def _resolve_data_roots(data_cfg: Dict[str, Any]) -> Tuple[Optional[Path], Optio
         raise FileNotFoundError("DATA_ROOT is not set and FEW_SHOT_ROOT is not set")
     data_root = require_path(data_root_value, kind="DATA_ROOT")
     return configured_data_root, None, data_root
+
+
+def _maybe_disable_legacy_cuda_fusers(device: str) -> Dict[str, Any]:
+    """Disable old CUDA JIT fusers that can fail NVRTC arch checks on new GPUs."""
+
+    summary: Dict[str, Any] = {
+        "device": str(device),
+        "disabled": [],
+        "unavailable": [],
+        "errors": {},
+    }
+    if not str(device).startswith("cuda"):
+        return summary
+
+    setters = (
+        ("nvfuser", "_jit_set_nvfuser_enabled", (False,)),
+        ("texpr_fuser", "_jit_set_texpr_fuser_enabled", (False,)),
+        ("profiling_executor", "_jit_set_profiling_executor", (False,)),
+        ("profiling_mode", "_jit_set_profiling_mode", (False,)),
+        ("gpu_fusion_override", "_jit_override_can_fuse_on_gpu", (False,)),
+    )
+    torch_c = getattr(torch, "_C", None)
+    for label, attr, args in setters:
+        fn = getattr(torch_c, attr, None)
+        if fn is None:
+            summary["unavailable"].append(label)
+            continue
+        try:
+            fn(*args)
+            summary["disabled"].append(label)
+        except Exception as exc:  # pragma: no cover - depends on torch build internals.
+            summary["errors"][label] = str(exc)
+    return summary
 
 
 def _resolve_base_checkpoint(
