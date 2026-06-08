@@ -11,6 +11,7 @@ from PIL import Image
 from llm_das_dinomaly.data import MVTecGoodDataset, load_tensor_cache, save_tensor_cache, save_torch_payload
 from llm_das_dinomaly.enhancer import MapFeatureHead
 from llm_das_dinomaly.pipelines.server_mvtec import (
+    _maybe_disable_legacy_cuda_fusers,
     _try_summarize_enhancer_checkpoint,
     _try_summarize_hard_cache,
     generate_hard_samples,
@@ -24,6 +25,56 @@ class DummyDinomaly(nn.Module):
     def forward(self, x):
         pooled = F.adaptive_avg_pool2d(x, (4, 4))
         return [pooled, pooled * 0.5], [pooled.roll(shifts=1, dims=-1), pooled * 0.25]
+
+
+def test_cuda_compat_helper_skips_non_cuda_device():
+    summary = _maybe_disable_legacy_cuda_fusers("cpu")
+
+    assert summary["device"] == "cpu"
+    assert summary["disabled"] == []
+    assert summary["errors"] == {}
+
+
+def test_cuda_compat_helper_disables_available_legacy_fusers(monkeypatch):
+    calls = []
+
+    class FakeTorchC:
+        def _jit_set_nvfuser_enabled(self, value):
+            calls.append(("nvfuser", value))
+
+        def _jit_set_texpr_fuser_enabled(self, value):
+            calls.append(("texpr", value))
+
+        def _jit_set_profiling_executor(self, value):
+            calls.append(("profiling_executor", value))
+
+        def _jit_set_profiling_mode(self, value):
+            calls.append(("profiling_mode", value))
+
+        def _jit_override_can_fuse_on_gpu(self, value):
+            calls.append(("gpu_fusion", value))
+
+    monkeypatch.setattr("llm_das_dinomaly.pipelines.server_mvtec.torch._C", FakeTorchC())
+
+    summary = _maybe_disable_legacy_cuda_fusers("cuda:4")
+
+    assert summary["device"] == "cuda:4"
+    assert summary["errors"] == {}
+    assert summary["unavailable"] == []
+    assert set(summary["disabled"]) == {
+        "nvfuser",
+        "texpr_fuser",
+        "profiling_executor",
+        "profiling_mode",
+        "gpu_fusion_override",
+    }
+    assert calls == [
+        ("nvfuser", False),
+        ("texpr", False),
+        ("profiling_executor", False),
+        ("profiling_mode", False),
+        ("gpu_fusion", False),
+    ]
 
 
 def test_server_pipeline_check_stage_with_fake_mvtec(tmp_path):
