@@ -9,6 +9,8 @@ venv/
 build/
 dist/
 *.egg-info/
+*.pyc
+*.pt
 
 # Local datasets, checkpoints, and generated experiment artifacts.
 /data/
@@ -19,6 +21,13 @@ dist/
 /cache/
 /answer/
 /prompt/4code/
+/*_outputs/
+/__pycache__/
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.cpython-*.pyc
 
 # Server-local path files. Keep examples tracked, but not real machine paths.
 /configs/server_paths.env

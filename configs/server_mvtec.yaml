@@ -42,9 +42,9 @@ hard_samples:
   regenerate: ${REGENERATE_HARD_SAMPLES:-false}
 
 enhancer:
-  epochs: ${ENHANCER_EPOCHS:-1}
-  hidden_dim: ${ENHANCER_HIDDEN_DIM:-128}
-  lr: ${ENHANCER_LR:-0.001}
+  epochs: ${ENHANCER_EPOCHS:-30}
+  hidden_dim: ${ENHANCER_HIDDEN_DIM:-256}
+  lr: ${ENHANCER_LR:-0.0003}
   retrain: ${RETRAIN_ENHANCER:-false}
 
 evaluation:
