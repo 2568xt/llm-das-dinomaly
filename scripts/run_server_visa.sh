@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CONFIG_PATH="${1:-configs/server_mpdd.yaml}"
+CONFIG_PATH="${1:-configs/server_visa.yaml}"
 ENV_FILE="${2:-${SERVER_ENV_FILE:-}}"
 OVERRIDE_CANDIDATES=(
   DATASET
@@ -51,8 +51,8 @@ for name in "${OVERRIDE_CANDIDATES[@]}"; do
   fi
 done
 
-if [[ -z "${ENV_FILE}" && -f "configs/server_paths_mpdd.env" ]]; then
-  ENV_FILE="configs/server_paths_mpdd.env"
+if [[ -z "${ENV_FILE}" && -f "configs/server_paths_visa.env" ]]; then
+  ENV_FILE="configs/server_paths_visa.env"
 fi
 
 if [[ ! -f "${CONFIG_PATH}" ]]; then
@@ -76,14 +76,14 @@ for idx in "${!OVERRIDE_NAMES[@]}"; do
 done
 
 RUN_MODE="${RUN_MODE:-smoke}"
-DATASET="${DATASET:-mpdd}"
+DATASET="${DATASET:-visa}"
 BASE_TRAIN_IF_MISSING="${BASE_TRAIN_IF_MISSING:-true}"
 export RUN_MODE
 export DATASET
 export BASE_TRAIN_IF_MISSING
 
 if [[ -z "${DATA_ROOT:-}" && -z "${FEW_SHOT_ROOT:-}" ]]; then
-  echo "Set DATA_ROOT to the MPDD root or FEW_SHOT_ROOT to a complete few-shot root" >&2
+  echo "Set DATA_ROOT to the preprocessed VisA_pytorch/1cls root or FEW_SHOT_ROOT to a complete few-shot root" >&2
   exit 2
 fi
 : "${OUTPUT_ROOT:?Set OUTPUT_ROOT to a writable output directory}"
@@ -97,7 +97,7 @@ if [[ ! -d "${DINOMALY_ROOT}" ]]; then
 fi
 
 if [[ "${RUN_MODE}" == "smoke" ]]; then
-  export MPDD_CATEGORY="${MPDD_CATEGORY:-bracket_black}"
+  export VISA_CATEGORY="${VISA_CATEGORY:-candle}"
 fi
 
 echo "[llm-das-dinomaly] config=${CONFIG_PATH}"

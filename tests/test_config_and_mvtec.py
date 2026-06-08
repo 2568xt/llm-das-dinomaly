@@ -5,9 +5,18 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
-from llm_das_dinomaly.data import MPDDGoodDataset, MVTecGoodDataset, list_mpdd_train_good, list_mvtec_train_good
+from llm_das_dinomaly.data import (
+    MPDDGoodDataset,
+    RotatedGoodDataset,
+    ViSAGoodDataset,
+    MVTecGoodDataset,
+    list_mpdd_train_good,
+    list_mvtec_train_good,
+    list_visa_train_good,
+)
 from llm_das_dinomaly.data.mpdd import MPDDTestDataset, list_mpdd_test_images
 from llm_das_dinomaly.data.mvtec import MVTecTestDataset, list_mvtec_test_images
+from llm_das_dinomaly.data.visa import ViSATestDataset, list_visa_test_images
 from llm_das_dinomaly.utils import ConfigError, expand_env, load_yaml_config, require_path
 
 
@@ -38,6 +47,21 @@ def test_server_mpdd_config_allows_empty_checkpoint_env(tmp_path):
     )
 
     assert cfg["data"]["dataset"] == "mpdd"
+    assert cfg["model"]["checkpoint_path"] == ""
+    assert cfg["base_training"]["train_if_missing"] == "true"
+
+
+def test_server_visa_config_allows_empty_checkpoint_env(tmp_path):
+    cfg = load_yaml_config(
+        Path("configs/server_visa.yaml"),
+        env={
+            "DATA_ROOT": str(tmp_path / "visa"),
+            "OUTPUT_ROOT": str(tmp_path / "out"),
+        },
+    )
+
+    assert cfg["data"]["dataset"] == "visa"
+    assert cfg["data"]["few_shot_root"] == ""
     assert cfg["model"]["checkpoint_path"] == ""
     assert cfg["base_training"]["train_if_missing"] == "true"
 
@@ -144,3 +168,56 @@ def test_mpdd_indexer_uses_mvtec_like_layout(tmp_path):
     _, mask, test_meta = test_dataset[0]
     assert mask.mode == "L"
     assert test_meta["defect_type"] == "anomaly"
+
+
+def test_visa_indexer_uses_preprocessed_1cls_layout(tmp_path):
+    root = tmp_path / "visa_1cls"
+    train_dir = root / "candle" / "train" / "good"
+    good_dir = root / "candle" / "test" / "good"
+    defect_dir = root / "candle" / "test" / "bad"
+    mask_dir = root / "candle" / "ground_truth" / "bad"
+    train_dir.mkdir(parents=True)
+    good_dir.mkdir(parents=True)
+    defect_dir.mkdir(parents=True)
+    mask_dir.mkdir(parents=True)
+    Image.new("RGB", (8, 10)).save(train_dir / "000.JPG")
+    Image.new("RGB", (8, 8), color=(0, 0, 0)).save(good_dir / "001.JPG")
+    Image.new("RGB", (8, 8), color=(255, 0, 0)).save(defect_dir / "002.JPG")
+    Image.new("L", (8, 8), color=255).save(mask_dir / "002.png")
+
+    train_records = list_visa_train_good(root, categories=["candle"])
+    test_records = list_visa_test_images(root, categories=["candle"], limit_per_category=2)
+    assert len(train_records) == 1
+    assert train_records[0].category == "candle"
+    assert [record.label for record in test_records] == [1, 0]
+    assert test_records[0].mask_path == mask_dir / "002.png"
+
+    train_dataset = ViSAGoodDataset(root, categories=["candle"])
+    test_dataset = ViSATestDataset(root, categories=["candle"])
+    image, meta = train_dataset[0]
+    assert image.mode == "RGB"
+    assert meta["category"] == "candle"
+    _, mask, test_meta = test_dataset[0]
+    assert mask.mode == "L"
+    assert test_meta["defect_type"] == "bad"
+
+
+def test_rotated_good_dataset_expands_quarter_turn_views(tmp_path):
+    root = tmp_path / "mvtec"
+    good_dir = root / "bottle" / "train" / "good"
+    good_dir.mkdir(parents=True)
+    Image.new("RGB", (8, 10), color=(0, 0, 0)).save(good_dir / "000.png")
+    Image.new("RGB", (12, 14), color=(255, 0, 0)).save(good_dir / "001.png")
+
+    base = MVTecGoodDataset(root, categories=["bottle"])
+    dataset = RotatedGoodDataset(base, angles=(0, 90, 180, 270))
+
+    assert len(dataset) == 8
+    first, first_meta = dataset[0]
+    rotated, rotated_meta = dataset[1]
+    assert first.size == (8, 10)
+    assert rotated.size == (10, 8)
+    assert first_meta["rotation_degrees"] == 0
+    assert rotated_meta["rotation_degrees"] == 90
+    assert rotated_meta["source_path"] == first_meta["source_path"]
+    assert rotated_meta["source_index"] == 0

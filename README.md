@@ -74,12 +74,16 @@ bash scripts/run_server_mvtec.sh
 
 Optional environment overrides:
 
-- `DATASET`: defaults to `mvtec` for the MVTec runner and `mpdd` for the MPDD
-  runner.
+- `DATASET`: defaults to `mvtec` for the MVTec runner, `mpdd` for the MPDD
+  runner, and `visa` for the ViSA runner.
+- `FEW_SHOT_ROOT`: optional complete MVTec-like dataset root. When set, it
+  replaces `DATA_ROOT` for base training, hard samples, enhancer training, and
+  evaluation.
 - `DINOMALY_ROOT`: defaults to `third_party/Dinomaly`.
 - `DEVICE`: defaults to `cuda`.
 - `MVTEC_CATEGORY`: defaults to `bottle` in smoke mode.
 - `MPDD_CATEGORY`: defaults to `bracket_black` in MPDD smoke mode.
+- `VISA_CATEGORY`: defaults to `candle` in ViSA smoke mode.
 - `RUN_MODE`: defaults to `smoke`.
 - `BATCH_SIZE`: defaults to `16`, matching the official Dinomaly runner's
   batch size for the main server pipeline.
@@ -121,8 +125,8 @@ evaluation metrics under `OUTPUT_ROOT`. Hard sample shards are saved under
 contains only the tensors needed for enhancer training; image, mask, and map
 tensors are stored only when `CACHE_IMAGES=true`. Existing valid caches and
 enhancer checkpoints are reused on the next run only when their dataset,
-categories, data root, backbone, and base checkpoint metadata match the current
-run. If a previous run left an
+categories, effective data root, few-shot/rotation settings, backbone, and base
+checkpoint metadata match the current run. If a previous run left an
 unreadable cache file, the runner moves it aside with a `.corrupt` suffix and
 rebuilds from any compatible shards that are present.
 
@@ -170,6 +174,26 @@ for train-only smoke runs. Per-epoch enhancer evaluation is image-level by
 default; set `EVAL_EPOCH_PIXEL_METRICS=true` only when the extra pixel-metric
 cost is intentional.
 
+## Few-Shot Rotation Runs
+
+Set `FEW_SHOT_ROOT` when you want a few-shot experiment. The directory must be a
+complete dataset root with `<category>/train/good`, `<category>/test/*`, and
+`<category>/ground_truth/*`. The runner uses all images present under
+`train/good`, expands them as `0/90/180/270` normal views before Dinomaly
+preprocessing, trains a new unified base checkpoint for the run, and evaluates
+on the same root's full test split.
+
+In few-shot mode, `CHECKPOINT_PATH` is ignored for base-checkpoint reuse. The
+DINOv2 pretrained encoder from the official Dinomaly recipe is still used; the
+new checkpoint is the Dinomaly reconstruction model for this few-shot root.
+
+Example MVTec few-shot run:
+
+```bash
+FEW_SHOT_ROOT=/path/to/fewshot_mvtec_root RUN_MODE=full SEARCH_BUDGET=24 EVAL_BATCH_SIZE=32 \
+EVAL_PIXEL_AUPRO=false bash scripts/run_server_mvtec.sh configs/server_mvtec.yaml configs/server_paths.env
+```
+
 ## Server MPDD Run
 
 MPDD is expected to be already arranged in the same layout style as MVTec:
@@ -204,6 +228,26 @@ For quick path validation:
 ```bash
 RUN_MODE=smoke EVAL_LIMIT_PER_CATEGORY=8 EVAL_PIXEL_METRICS=false \
 bash scripts/run_server_mpdd.sh configs/server_mpdd.yaml configs/server_paths_mpdd.env
+```
+
+## Server ViSA Run
+
+ViSA is expected to be preprocessed with the official Dinomaly/Spot-Diff split
+into the MVTec-like `VisA_pytorch/1cls` layout. This repository does not prepare
+raw ViSA plus CSV splits inside the server runner.
+
+Prepare a server-local env file:
+
+```bash
+cp configs/server_paths_visa.example.env configs/server_paths_visa.env
+# Edit DATA_ROOT or FEW_SHOT_ROOT, OUTPUT_ROOT, DEVICE, and optional CHECKPOINT_PATH.
+```
+
+Recommended ViSA few-shot run:
+
+```bash
+FEW_SHOT_ROOT=/path/to/fewshot_visa_1cls RUN_MODE=full SEARCH_BUDGET=24 EVAL_BATCH_SIZE=32 \
+EVAL_PIXEL_AUPRO=false bash scripts/run_server_visa.sh configs/server_visa.yaml configs/server_paths_visa.env
 ```
 
 ## Integration Notes
