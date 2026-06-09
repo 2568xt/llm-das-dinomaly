@@ -4,8 +4,11 @@
 
 - Never push code changes directly to `main`.
 - For every code or documentation change, start from the latest `main` and create a feature branch named `codex/<short-task-name>`.
+- Never push new commits to a branch whose pull request has already been merged or closed. If follow-up work is needed after merge, fetch the latest `main`, create a new `codex/<short-task-name>` branch, cherry-pick or reapply only the missing commits, and open a new pull request.
+- Before pushing to an existing feature branch, verify that its pull request is still open. If `gh pr view` reports `MERGED` or `CLOSED`, stop and create a new branch instead of reusing it.
 - Commit only intentional project files. Do not commit server-local paths, checkpoints, datasets, caches, or outputs.
 - Push the feature branch and open a pull request into `main` with `gh pr create`.
+- After a pull request is merged, delete the remote and local feature branches unless the user explicitly asks to keep them. The remote branch list should normally contain only `main` plus active, unmerged work.
 - Each PR description must include:
   - Problem or motivation.
   - Summary of changes.
