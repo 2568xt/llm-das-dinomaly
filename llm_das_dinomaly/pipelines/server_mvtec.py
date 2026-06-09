@@ -486,6 +486,11 @@ def _maybe_disable_legacy_cuda_fusers(device: str) -> Dict[str, Any]:
     return summary
 
 
+def _initialize_trainable_layers_then_move(model, trunc_normal_, device: str):
+    _init_trainable_layers(model, trunc_normal_)
+    return model.to(device)
+
+
 def _resolve_base_checkpoint(
     model_cfg: Dict[str, Any],
     base_cfg: Dict[str, Any],
@@ -782,8 +787,8 @@ def train_unified_dinomaly_checkpoint(
             mask_neighbor_size=0,
             fuse_layer_encoder=fuse_encoder,
             fuse_layer_decoder=fuse_decoder,
-        ).to(device)
-        _init_trainable_layers(model, trunc_normal_)
+        )
+        model = _initialize_trainable_layers_then_move(model, trunc_normal_, device)
         trainable = nn.ModuleList([model.bottleneck, model.decoder])
         optimizer = StableAdamW(
             [{"params": trainable.parameters()}],

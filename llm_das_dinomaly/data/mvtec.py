@@ -266,9 +266,14 @@ def _rotate_quarter_turn(image: Image.Image, angle: int) -> Image.Image:
     if angle == 0:
         return image.copy()
     if angle == 90:
-        return image.transpose(Image.Transpose.ROTATE_90)
+        return image.transpose(_image_transpose_constant("ROTATE_90"))
     if angle == 180:
-        return image.transpose(Image.Transpose.ROTATE_180)
+        return image.transpose(_image_transpose_constant("ROTATE_180"))
     if angle == 270:
-        return image.transpose(Image.Transpose.ROTATE_270)
+        return image.transpose(_image_transpose_constant("ROTATE_270"))
     raise ValueError("rotation angles must be quarter turns: 0, 90, 180, 270")
+
+
+def _image_transpose_constant(name: str):
+    transpose_namespace = getattr(Image, "Transpose", Image)
+    return getattr(transpose_namespace, name)

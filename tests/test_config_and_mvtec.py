@@ -15,7 +15,7 @@ from llm_das_dinomaly.data import (
     list_visa_train_good,
 )
 from llm_das_dinomaly.data.mpdd import MPDDTestDataset, list_mpdd_test_images
-from llm_das_dinomaly.data.mvtec import MVTecTestDataset, list_mvtec_test_images
+from llm_das_dinomaly.data.mvtec import MVTecTestDataset, _rotate_quarter_turn, list_mvtec_test_images
 from llm_das_dinomaly.data.visa import ViSATestDataset, list_visa_test_images
 from llm_das_dinomaly.utils import ConfigError, expand_env, load_yaml_config, require_path
 
@@ -221,3 +221,11 @@ def test_rotated_good_dataset_expands_quarter_turn_views(tmp_path):
     assert rotated_meta["rotation_degrees"] == 90
     assert rotated_meta["source_path"] == first_meta["source_path"]
     assert rotated_meta["source_index"] == 0
+
+
+def test_rotate_quarter_turn_supports_legacy_pillow_constants(monkeypatch):
+    monkeypatch.delattr(Image, "Transpose", raising=False)
+
+    rotated = _rotate_quarter_turn(Image.new("RGB", (8, 10)), 90)
+
+    assert rotated.size == (10, 8)
