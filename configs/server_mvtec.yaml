@@ -29,6 +29,11 @@ base_training:
   num_workers: ${EVAL_NUM_WORKERS:-4}
   checkpoint_dir: ${BASE_CHECKPOINT_DIR:-}
 
+few_shot_training:
+  base_total_iters: ${FEW_SHOT_BASE_TOTAL_ITERS:-2000}
+  base_eval_interval: ${FEW_SHOT_BASE_EVAL_INTERVAL:-1000}
+  enhancer_epochs: ${FEW_SHOT_ENHANCER_EPOCHS:-10}
+
 hard_samples:
   search_budget: ${SEARCH_BUDGET:-4}
   max_samples: ${MAX_SAMPLES:-4}
