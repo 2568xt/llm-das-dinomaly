@@ -92,6 +92,7 @@ def run_pipeline(cfg: Dict[str, Any], *, stage: str = "all") -> Dict[str, Any]:
     enhancer_cfg = cfg.get("enhancer", {})
     eval_cfg = cfg.get("evaluation", {})
     base_cfg = cfg.get("base_training", {})
+    few_shot_training_cfg = cfg.get("few_shot_training", {})
 
     output_root = Path(runtime.get("output_root", "outputs/server_mvtec")).expanduser()
     output_root.mkdir(parents=True, exist_ok=True)
@@ -106,6 +107,12 @@ def run_pipeline(cfg: Dict[str, Any], *, stage: str = "all") -> Dict[str, Any]:
     dataset_spec = _dataset_spec(dataset_name)
     configured_data_root, few_shot_root, data_root = _resolve_data_roots(data_cfg)
     few_shot_active = few_shot_root is not None
+    if few_shot_active:
+        base_cfg, enhancer_cfg = _apply_few_shot_training_budget(
+            base_cfg,
+            enhancer_cfg,
+            few_shot_training_cfg,
+        )
     dinomaly_root = require_path(model_cfg["dinomaly_root"], kind="DINOMALY_ROOT")
     categories = data_cfg.get("categories") or [dataset_spec["default_category"]]
     limit_per_category = data_cfg.get("limit_per_category")
@@ -190,6 +197,11 @@ def run_pipeline(cfg: Dict[str, Any], *, stage: str = "all") -> Dict[str, Any]:
             "rotation_angles": list(rotation_angles),
             "base_normal_images": len(base_dataset),
             "rotated_normal_views": len(dataset),
+            "training_budget": {
+                "base_total_iters": int(base_cfg.get("total_iters", 10000)),
+                "base_eval_interval": int(base_cfg.get("eval_interval", 5000)),
+                "enhancer_epochs": int(enhancer_cfg.get("epochs", 1)),
+            },
         },
     }
     if base_summary:
@@ -451,6 +463,22 @@ def _resolve_data_roots(data_cfg: Dict[str, Any]) -> Tuple[Optional[Path], Optio
         raise FileNotFoundError("DATA_ROOT is not set and FEW_SHOT_ROOT is not set")
     data_root = require_path(data_root_value, kind="DATA_ROOT")
     return configured_data_root, None, data_root
+
+
+def _apply_few_shot_training_budget(
+    base_cfg: Dict[str, Any],
+    enhancer_cfg: Dict[str, Any],
+    few_shot_cfg: Dict[str, Any],
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    base_out = dict(base_cfg)
+    enhancer_out = dict(enhancer_cfg)
+    if "base_total_iters" in few_shot_cfg:
+        base_out["total_iters"] = few_shot_cfg["base_total_iters"]
+    if "base_eval_interval" in few_shot_cfg:
+        base_out["eval_interval"] = few_shot_cfg["base_eval_interval"]
+    if "enhancer_epochs" in few_shot_cfg:
+        enhancer_out["epochs"] = few_shot_cfg["enhancer_epochs"]
+    return base_out, enhancer_out
 
 
 def _maybe_disable_legacy_cuda_fusers(device: str) -> Dict[str, Any]:

@@ -92,6 +92,12 @@ Optional environment overrides:
   `CHECKPOINT_PATH` to rebuild the unified base checkpoint.
 - `BASE_TOTAL_ITERS`: defaults to `10000` for MPDD base training.
 - `BASE_EVAL_INTERVAL`: defaults to `5000` for MPDD base training.
+- `FEW_SHOT_BASE_TOTAL_ITERS`: defaults to `2000` and overrides
+  `BASE_TOTAL_ITERS` only when `FEW_SHOT_ROOT` is set.
+- `FEW_SHOT_BASE_EVAL_INTERVAL`: defaults to `1000` and overrides
+  `BASE_EVAL_INTERVAL` only when `FEW_SHOT_ROOT` is set.
+- `FEW_SHOT_ENHANCER_EPOCHS`: defaults to `10` and overrides
+  `ENHANCER_EPOCHS` only when `FEW_SHOT_ROOT` is set.
 - `BASE_CHECKPOINT_DIR`: defaults to `OUTPUT_ROOT/base_checkpoints`.
 - `MAX_SAMPLES`: defaults to `4`; use `all` for a full run.
 - `SEARCH_BUDGET`: defaults to `4`.
@@ -186,6 +192,9 @@ on the same root's full test split.
 In few-shot mode, `CHECKPOINT_PATH` is ignored for base-checkpoint reuse. The
 DINOv2 pretrained encoder from the official Dinomaly recipe is still used; the
 new checkpoint is the Dinomaly reconstruction model for this few-shot root.
+Few-shot runs use shorter training defaults than full-data runs:
+`FEW_SHOT_BASE_TOTAL_ITERS=2000`, `FEW_SHOT_BASE_EVAL_INTERVAL=1000`, and
+`FEW_SHOT_ENHANCER_EPOCHS=10`.
 
 Example MVTec few-shot run:
 

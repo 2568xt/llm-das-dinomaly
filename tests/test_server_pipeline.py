@@ -460,18 +460,24 @@ def test_few_shot_all_stage_trains_new_base_and_generates_rotated_hard_samples(t
     dinomaly_root = tmp_path / "Dinomaly"
     (dinomaly_root / "models").mkdir(parents=True)
     (dinomaly_root / "models" / "uad.py").write_text("# fake\n", encoding="utf-8")
-    calls = []
+    base_calls = []
+    enhancer_calls = []
 
     def fake_base_train(**kwargs):
-        calls.append(kwargs)
+        base_calls.append(kwargs)
         Path(kwargs["output_path"]).parent.mkdir(parents=True, exist_ok=True)
         Path(kwargs["output_path"]).write_bytes(b"few-shot-trained")
         return {"checkpoint_path": str(kwargs["output_path"]), "trained": True}
+
+    def fake_train_enhancer(cache_path, output_path, **kwargs):
+        enhancer_calls.append(kwargs)
+        return {"checkpoint_path": str(output_path), "epochs": kwargs["epochs"], "reused": False}
 
     def build_dummy_wrapper(**kwargs):
         return _dummy_wrapper(), {"backend": "dummy"}
 
     monkeypatch.setattr("llm_das_dinomaly.pipelines.server_mvtec.train_unified_dinomaly_checkpoint", fake_base_train)
+    monkeypatch.setattr("llm_das_dinomaly.pipelines.server_mvtec.train_enhancer_from_cache", fake_train_enhancer)
     monkeypatch.setattr("llm_das_dinomaly.pipelines.server_mvtec.build_dinomaly_wrapper", build_dummy_wrapper)
     summary = run_pipeline(
         {
@@ -483,16 +489,25 @@ def test_few_shot_all_stage_trains_new_base_and_generates_rotated_hard_samples(t
                 "limit_per_category": 1,
             },
             "model": {"dinomaly_root": str(dinomaly_root), "checkpoint_path": str(old_checkpoint)},
-            "base_training": {"checkpoint_dir": str(tmp_path / "base"), "total_iters": 10},
+            "base_training": {"checkpoint_dir": str(tmp_path / "base"), "total_iters": 999, "eval_interval": 333},
+            "few_shot_training": {"base_total_iters": 12, "base_eval_interval": 6, "enhancer_epochs": 2},
             "hard_samples": {"search_budget": 1, "max_samples": 1, "shard_size": 4},
-            "enhancer": {"epochs": 1, "hidden_dim": 4},
+            "enhancer": {"epochs": 99, "hidden_dim": 4},
             "evaluation": {"enabled": False},
         },
         stage="all",
     )
 
-    assert calls
-    assert calls[0]["data_root"] == few_shot_root
+    assert base_calls
+    assert base_calls[0]["data_root"] == few_shot_root
+    assert base_calls[0]["total_iters"] == 12
+    assert base_calls[0]["eval_interval"] == 6
+    assert enhancer_calls[0]["epochs"] == 2
+    assert summary["few_shot"]["training_budget"] == {
+        "base_total_iters": 12,
+        "base_eval_interval": 6,
+        "enhancer_epochs": 2,
+    }
     assert summary["base_checkpoint"]["source"] == "few_shot_trained"
     assert summary["base_checkpoint"]["ignored_checkpoint_path"] == str(old_checkpoint)
     assert summary["hard_samples"]["num_candidates"] == 8

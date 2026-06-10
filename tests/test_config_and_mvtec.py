@@ -64,6 +64,9 @@ def test_server_visa_config_allows_empty_checkpoint_env(tmp_path):
     assert cfg["data"]["few_shot_root"] == ""
     assert cfg["model"]["checkpoint_path"] == ""
     assert cfg["base_training"]["train_if_missing"] == "true"
+    assert cfg["few_shot_training"]["base_total_iters"] == "2000"
+    assert cfg["few_shot_training"]["base_eval_interval"] == "1000"
+    assert cfg["few_shot_training"]["enhancer_epochs"] == "10"
 
 
 def test_mvtec_train_good_indexer(tmp_path):

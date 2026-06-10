@@ -64,7 +64,9 @@ bash scripts/run_server_mpdd.sh configs/server_mpdd.yaml configs/server_paths_mp
 For few-shot rotation experiments, set `FEW_SHOT_ROOT` to a complete dataset
 root. This root replaces `DATA_ROOT`, trains a new unified base checkpoint for
 the run, expands `train/good` into `0/90/180/270` normal views, and evaluates on
-the same root's complete test set:
+the same root's complete test set. Few-shot runs intentionally use shorter
+defaults than full-data training: `FEW_SHOT_BASE_TOTAL_ITERS=2000`,
+`FEW_SHOT_BASE_EVAL_INTERVAL=1000`, and `FEW_SHOT_ENHANCER_EPOCHS=10`.
 
 ```bash
 FEW_SHOT_ROOT=/path/to/fewshot_root RUN_MODE=full SEARCH_BUDGET=24 EVAL_BATCH_SIZE=32 \
