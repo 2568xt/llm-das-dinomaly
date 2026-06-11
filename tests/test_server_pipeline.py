@@ -11,6 +11,7 @@ from PIL import Image
 from llm_das_dinomaly.data import MVTecGoodDataset, load_tensor_cache, save_tensor_cache, save_torch_payload
 from llm_das_dinomaly.enhancer import MapFeatureHead
 from llm_das_dinomaly.pipelines.server_mvtec import (
+    _collect_run_metadata,
     _initialize_trainable_layers_then_move,
     _maybe_disable_legacy_cuda_fusers,
     _try_summarize_enhancer_checkpoint,
@@ -124,6 +125,44 @@ def test_server_pipeline_check_stage_with_fake_mvtec(tmp_path):
 
     assert summary["num_normal_images"] == 1
     assert (tmp_path / "out" / "run_summary.json").exists()
+    effective_config_path = tmp_path / "out" / "effective_config.json"
+    assert effective_config_path.exists()
+    assert summary["effective_config_path"] == str(effective_config_path)
+    assert summary["run_config"]["effective_config"]["runtime"]["batch_size"] == 1
+    assert summary["run_config"]["effective_config"]["model"]["checkpoint_path"] == str(checkpoint)
+    assert summary["run_config"]["resolved_yaml_config"]["runtime"]["output_root"] == str(tmp_path / "out")
+
+
+def test_collect_run_metadata_records_env_sources():
+    metadata = _collect_run_metadata(
+        "configs/server_visa.yaml",
+        "all",
+        env={
+            "LLM_DAS_RUNNER": "run_server_visa.sh",
+            "LLM_DAS_ENV_FILE": "configs/server_paths_visa.env",
+            "LLM_DAS_ENV_FILE_OVERRIDES": "FEW_SHOT_ROOT,OUTPUT_ROOT,FEW_SHOT_BASE_TOTAL_ITERS",
+            "LLM_DAS_INLINE_OVERRIDES": "FEW_SHOT_BASE_TOTAL_ITERS,EVAL_BATCH_SIZE",
+            "FEW_SHOT_ROOT": "/data/fewshot",
+            "OUTPUT_ROOT": "/data/out",
+            "FEW_SHOT_BASE_TOTAL_ITERS": "1000",
+            "EVAL_BATCH_SIZE": "32",
+        },
+    )
+
+    assert metadata["runner"] == "run_server_visa.sh"
+    assert metadata["env_file"] == "configs/server_paths_visa.env"
+    assert metadata["env_file_override_names"] == [
+        "FEW_SHOT_ROOT",
+        "OUTPUT_ROOT",
+        "FEW_SHOT_BASE_TOTAL_ITERS",
+    ]
+    assert metadata["inline_override_names"] == ["FEW_SHOT_BASE_TOTAL_ITERS", "EVAL_BATCH_SIZE"]
+    assert metadata["override_values"] == {
+        "FEW_SHOT_ROOT": "/data/fewshot",
+        "OUTPUT_ROOT": "/data/out",
+        "FEW_SHOT_BASE_TOTAL_ITERS": "1000",
+        "EVAL_BATCH_SIZE": "32",
+    }
 
 
 def test_server_pipeline_reports_missing_checkpoint(tmp_path):

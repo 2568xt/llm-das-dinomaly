@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import sys
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Set, Tuple
 
 import torch
 
@@ -61,6 +62,48 @@ DATASET_SPECS = {
 }
 
 FEW_SHOT_ROTATION_ANGLES = (0, 90, 180, 270)
+RUN_ENV_VARS = (
+    "DATASET",
+    "DATA_ROOT",
+    "FEW_SHOT_ROOT",
+    "CHECKPOINT_PATH",
+    "OUTPUT_ROOT",
+    "DINOMALY_ROOT",
+    "DEVICE",
+    "RUN_MODE",
+    "RUN_STAGE",
+    "BATCH_SIZE",
+    "MVTEC_CATEGORY",
+    "MPDD_CATEGORY",
+    "VISA_CATEGORY",
+    "BASE_TRAIN_IF_MISSING",
+    "BASE_FORCE_RETRAIN",
+    "BASE_TOTAL_ITERS",
+    "BASE_EVAL_INTERVAL",
+    "BASE_CHECKPOINT_DIR",
+    "FEW_SHOT_BASE_TOTAL_ITERS",
+    "FEW_SHOT_BASE_EVAL_INTERVAL",
+    "FEW_SHOT_ENHANCER_EPOCHS",
+    "MAX_SAMPLES",
+    "SEARCH_BUDGET",
+    "HARD_SAMPLE_SHARD_SIZE",
+    "CACHE_IMAGES",
+    "REGENERATE_HARD_SAMPLES",
+    "RETRAIN_ENHANCER",
+    "ENHANCER_EPOCHS",
+    "ENHANCER_HIDDEN_DIM",
+    "ENHANCER_LR",
+    "PROGRESS",
+    "EVAL_ENABLED",
+    "EVAL_BATCH_SIZE",
+    "EVAL_NUM_WORKERS",
+    "EVAL_RESIZE_MASK",
+    "EVAL_LIMIT_PER_CATEGORY",
+    "EVAL_PIXEL_METRICS",
+    "EVAL_PIXEL_AUPRO",
+    "EVAL_EPOCH_PIXEL_METRICS",
+    "EVAL_FUSION_BETA",
+)
 
 
 def main(argv: Optional[List[str]] = None) -> None:
@@ -78,13 +121,17 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     try:
         cfg = load_yaml_config(args.config)
-        summary = run_pipeline(cfg, stage=args.stage)
+        summary = run_pipeline(
+            cfg,
+            stage=args.stage,
+            run_metadata=_collect_run_metadata(args.config, args.stage),
+        )
     except (FileNotFoundError, KeyError, ValueError, RuntimeError) as exc:
         raise SystemExit(f"ERROR: {exc}") from None
     print(json.dumps(summary, indent=2, sort_keys=True))
 
 
-def run_pipeline(cfg: Dict[str, Any], *, stage: str = "all") -> Dict[str, Any]:
+def run_pipeline(cfg: Dict[str, Any], *, stage: str = "all", run_metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     runtime = cfg.get("runtime", {})
     data_cfg = cfg.get("data", {})
     model_cfg = cfg.get("model", {})
@@ -175,6 +222,98 @@ def run_pipeline(cfg: Dict[str, Any], *, stage: str = "all") -> Dict[str, Any]:
         show_progress=show_progress,
         few_shot_active=few_shot_active,
     )
+    hard_cache = output_root / "hard_samples.pt"
+    enhancer_path = output_root / "enhancer.pt"
+    regenerate_hard = _as_bool(hard_cfg.get("regenerate", False))
+    retrain_enhancer = _as_bool(enhancer_cfg.get("retrain", False))
+    if few_shot_active and base_summary.get("trained"):
+        regenerate_hard = True
+        retrain_enhancer = True
+    hard_search_budget = int(hard_cfg.get("search_budget", 4))
+    hard_max_samples = _resolve_max_samples(hard_cfg.get("max_samples", 8), mode=mode)
+    if few_shot_active:
+        hard_max_samples = len(dataset)
+    hard_target_samples = min(len(dataset), hard_max_samples)
+    cache_images = _as_bool(hard_cfg.get("cache_images", False))
+    hard_shard_size = int(hard_cfg.get("shard_size", 32))
+    backbone = str(model_cfg.get("backbone", "dinov2reg_vit_base_14"))
+    effective_config = {
+        "stage": stage,
+        "runtime": {
+            "mode": mode,
+            "dataset": dataset_name,
+            "device": device,
+            "seed": seed,
+            "batch_size": batch_size,
+            "output_root": str(output_root),
+            "progress": show_progress,
+        },
+        "data": {
+            "dataset": dataset_name,
+            "root": str(data_root),
+            "configured_root": None if configured_data_root is None else str(configured_data_root),
+            "few_shot_root": None if few_shot_root is None else str(few_shot_root),
+            "categories": categories,
+            "limit_per_category": limit_per_category,
+            "num_base_normal_images": len(base_dataset),
+            "num_normal_views": len(dataset),
+        },
+        "model": {
+            "dinomaly_root": str(dinomaly_root),
+            "checkpoint_path": None if checkpoint_path is None else str(checkpoint_path),
+            "backbone": backbone,
+            "strict_checkpoint": bool(model_cfg.get("strict_checkpoint", False)),
+        },
+        "base_training": {
+            "train_if_missing": _as_bool(base_cfg.get("train_if_missing", False)),
+            "force_retrain": _as_bool(base_cfg.get("force_retrain", False)),
+            "total_iters": int(base_cfg.get("total_iters", 10000)),
+            "eval_interval": int(base_cfg.get("eval_interval", 5000)),
+            "batch_size": int(base_cfg.get("batch_size", 16)),
+            "num_workers": int(base_cfg.get("num_workers", 4)),
+            "checkpoint_dir": str(Path(base_cfg.get("checkpoint_dir") or (output_root / "base_checkpoints")).expanduser()),
+        },
+        "few_shot_training": {
+            "active": few_shot_active,
+            "rotation_angles": list(rotation_angles),
+            "base_total_iters": int(base_cfg.get("total_iters", 10000)),
+            "base_eval_interval": int(base_cfg.get("eval_interval", 5000)),
+            "enhancer_epochs": int(enhancer_cfg.get("epochs", 1)),
+        },
+        "hard_samples": {
+            "search_budget": hard_search_budget,
+            "max_samples": "all" if hard_max_samples >= 10**12 else hard_max_samples,
+            "target_samples": hard_target_samples,
+            "shard_size": hard_shard_size,
+            "cache_images": cache_images,
+            "regenerate": regenerate_hard,
+        },
+        "enhancer": {
+            "epochs": int(enhancer_cfg.get("epochs", 1)),
+            "hidden_dim": int(enhancer_cfg.get("hidden_dim", 128)),
+            "lr": float(enhancer_cfg.get("lr", 1e-3)),
+            "retrain": retrain_enhancer,
+        },
+        "evaluation": {
+            "enabled": eval_enabled,
+            "batch_size": eval_batch_size,
+            "num_workers": eval_num_workers,
+            "resize_mask": eval_resize_mask,
+            "limit_per_category": eval_limit_per_category,
+            "pixel_metrics": eval_pixel_metrics,
+            "pixel_aupro": eval_pixel_aupro,
+            "epoch_pixel_metrics": eval_epoch_pixel_metrics,
+            "beta": eval_beta,
+        },
+    }
+    run_config = _build_run_config(
+        cfg=cfg,
+        stage=stage,
+        run_metadata=run_metadata,
+        effective_config=effective_config,
+    )
+    effective_config_path = output_root / "effective_config.json"
+    _write_json(effective_config_path, run_config)
     summary: Dict[str, Any] = {
         "stage": stage,
         "mode": mode,
@@ -190,6 +329,8 @@ def run_pipeline(cfg: Dict[str, Any], *, stage: str = "all") -> Dict[str, Any]:
         "num_base_normal_images": len(base_dataset),
         "output_root": str(output_root),
         "checkpoint_path": None if checkpoint_path is None else str(checkpoint_path),
+        "effective_config_path": str(effective_config_path),
+        "run_config": run_config,
         "few_shot": {
             "active": few_shot_active,
             "effective_data_root": str(data_root),
@@ -220,7 +361,6 @@ def run_pipeline(cfg: Dict[str, Any], *, stage: str = "all") -> Dict[str, Any]:
             "CHECKPOINT_PATH is missing. Set CHECKPOINT_PATH or enable BASE_TRAIN_IF_MISSING for stage=all."
         )
 
-    backbone = str(model_cfg.get("backbone", "dinov2reg_vit_base_14"))
     cache_context = _cache_context(
         dataset_name=dataset_name,
         categories=categories,
@@ -247,21 +387,6 @@ def run_pipeline(cfg: Dict[str, Any], *, stage: str = "all") -> Dict[str, Any]:
             )
             summary["wrapper"] = wrapper_pair[1]
         return wrapper_pair[0]
-
-    hard_cache = output_root / "hard_samples.pt"
-    enhancer_path = output_root / "enhancer.pt"
-    regenerate_hard = _as_bool(hard_cfg.get("regenerate", False))
-    retrain_enhancer = _as_bool(enhancer_cfg.get("retrain", False))
-    if few_shot_active and base_summary.get("trained"):
-        regenerate_hard = True
-        retrain_enhancer = True
-    hard_search_budget = int(hard_cfg.get("search_budget", 4))
-    hard_max_samples = _resolve_max_samples(hard_cfg.get("max_samples", 8), mode=mode)
-    if few_shot_active:
-        hard_max_samples = len(dataset)
-    hard_target_samples = min(len(dataset), hard_max_samples)
-    cache_images = _as_bool(hard_cfg.get("cache_images", False))
-    hard_shard_size = int(hard_cfg.get("shard_size", 32))
 
     if stage == "eval":
         evaluation_summary: Dict[str, Any] = {}
@@ -1693,6 +1818,64 @@ def _dict_float(mapping: Any, key: str) -> Optional[float]:
 
 def _warn(message: str) -> None:
     print(f"[llm-das-dinomaly] {message}", file=sys.stderr, flush=True)
+
+
+def _collect_run_metadata(config_path: str, stage: str, env: Optional[Mapping[str, str]] = None) -> Dict[str, Any]:
+    env = env or os.environ
+    inline_names = _split_env_names(env.get("LLM_DAS_INLINE_OVERRIDES", ""))
+    env_file_names = _split_env_names(env.get("LLM_DAS_ENV_FILE_OVERRIDES", ""))
+    requested_names = set(inline_names) | set(env_file_names)
+    tracked_names = [name for name in RUN_ENV_VARS if name in requested_names]
+    return {
+        "config_path": str(config_path),
+        "stage": stage,
+        "runner": env.get("LLM_DAS_RUNNER") or None,
+        "stage_arg": env.get("LLM_DAS_STAGE_ARG") or None,
+        "env_file": env.get("LLM_DAS_ENV_FILE") or None,
+        "inline_override_names": inline_names,
+        "env_file_override_names": env_file_names,
+        "override_values": {name: env[name] for name in tracked_names if name in env},
+        "override_precedence": "inline environment values override env-file values; YAML defaults fill the rest",
+    }
+
+
+def _split_env_names(value: str) -> List[str]:
+    names: List[str] = []
+    seen: Set[str] = set()
+    for item in value.split(","):
+        name = item.strip()
+        if name and name not in seen:
+            names.append(name)
+            seen.add(name)
+    return names
+
+
+def _build_run_config(
+    *,
+    cfg: Dict[str, Any],
+    stage: str,
+    run_metadata: Optional[Dict[str, Any]],
+    effective_config: Dict[str, Any],
+) -> Dict[str, Any]:
+    metadata = dict(run_metadata or {})
+    metadata.setdefault("stage", stage)
+    return {
+        "metadata": _json_ready(metadata),
+        "resolved_yaml_config": _json_ready(cfg),
+        "effective_config": _json_ready(effective_config),
+    }
+
+
+def _json_ready(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _json_ready(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_ready(item) for item in value]
+    if isinstance(value, set):
+        return sorted(_json_ready(item) for item in value)
+    return value
 
 
 def _write_json(path: Path, payload: Dict[str, Any]) -> None:
