@@ -64,13 +64,16 @@ bash scripts/run_server_mvtec.sh configs/server_mvtec.yaml configs/server_paths.
 ```
 
 If `configs/server_paths.env` exists, `scripts/run_server_mvtec.sh` also loads
-it automatically, so this shorter command works after the first edit. Inline
-environment overrides on the shell command take precedence over values in the
-env file, which is useful for quick smoke/eval runs:
+it automatically, so this shorter command works after the first edit:
 
 ```bash
 bash scripts/run_server_mvtec.sh
 ```
+
+For tracked experiments, put every experiment knob in the env file instead of
+leaving it only in a one-off shell prefix. Inline environment overrides still
+take precedence for ad-hoc checks, and the runner records their names and final
+values in `OUTPUT_ROOT/effective_config.json`.
 
 Optional environment overrides:
 
@@ -85,6 +88,8 @@ Optional environment overrides:
 - `MPDD_CATEGORY`: defaults to `bracket_black` in MPDD smoke mode.
 - `VISA_CATEGORY`: defaults to `candle` in ViSA smoke mode.
 - `RUN_MODE`: defaults to `smoke`.
+- `RUN_STAGE`: defaults to `all`; runner scripts also accept the stage as the
+  third positional argument, for example `eval`.
 - `BATCH_SIZE`: defaults to `16`, matching the official Dinomaly runner's
   batch size for the main server pipeline.
 - `BASE_TRAIN_IF_MISSING`: defaults to `false` for MVTec and `true` for MPDD.
@@ -125,8 +130,11 @@ Optional environment overrides:
 - `EVAL_EPOCH_PIXEL_METRICS`: defaults to `false` so per-epoch enhancer
   evaluations stay image-level and fast.
 
-The run writes `hard_samples.pt`, `enhancer.pt`, `run_summary.json`, and
-evaluation metrics under `OUTPUT_ROOT`. Hard sample shards are saved under
+The run writes `effective_config.json`, `hard_samples.pt`, `enhancer.pt`,
+`run_summary.json`, and evaluation metrics under `OUTPUT_ROOT`.
+`effective_config.json` contains the resolved YAML config, final typed pipeline
+settings, env-file path, env-file keys, and any inline override values seen by
+the runner. Hard sample shards are saved under
 `OUTPUT_ROOT/hard_samples_shards/`. By default, `hard_samples.pt` is compact and
 contains only the tensors needed for enhancer training; image, mask, and map
 tensors are stored only when `CACHE_IMAGES=true`. Existing valid caches and
@@ -196,11 +204,19 @@ Few-shot runs use shorter training defaults than full-data runs:
 `FEW_SHOT_BASE_TOTAL_ITERS=2000`, `FEW_SHOT_BASE_EVAL_INTERVAL=1000`, and
 `FEW_SHOT_ENHANCER_EPOCHS=10`.
 
-Example MVTec few-shot run:
+Example MVTec few-shot run. Edit these values into
+`configs/server_paths.env`, then run the script without a shell prefix:
+
+```dotenv
+FEW_SHOT_ROOT=/path/to/fewshot_mvtec_root
+RUN_MODE=full
+SEARCH_BUDGET=24
+EVAL_BATCH_SIZE=32
+EVAL_PIXEL_AUPRO=false
+```
 
 ```bash
-FEW_SHOT_ROOT=/path/to/fewshot_mvtec_root RUN_MODE=full SEARCH_BUDGET=24 EVAL_BATCH_SIZE=32 \
-EVAL_PIXEL_AUPRO=false bash scripts/run_server_mvtec.sh configs/server_mvtec.yaml configs/server_paths.env
+bash scripts/run_server_mvtec.sh configs/server_mvtec.yaml configs/server_paths.env
 ```
 
 ## Server MPDD Run
@@ -224,18 +240,31 @@ is found and `BASE_TRAIN_IF_MISSING=true`, it trains a unified Dinomaly-B
 checkpoint with the MPDD classes before generating hard samples and training the
 enhancer.
 
-Recommended full MPDD run:
+Recommended full MPDD run. Put these values in
+`configs/server_paths_mpdd.env` for the experiment:
+
+```dotenv
+RUN_MODE=full
+MAX_SAMPLES=all
+SEARCH_BUDGET=24
+EVAL_BATCH_SIZE=32
+EVAL_PIXEL_AUPRO=false
+BASE_TRAIN_IF_MISSING=true
+```
 
 ```bash
-RUN_MODE=full MAX_SAMPLES=all SEARCH_BUDGET=24 EVAL_BATCH_SIZE=32 \
-EVAL_PIXEL_AUPRO=false BASE_TRAIN_IF_MISSING=true \
 bash scripts/run_server_mpdd.sh configs/server_mpdd.yaml configs/server_paths_mpdd.env
 ```
 
 For quick path validation:
 
+```dotenv
+RUN_MODE=smoke
+EVAL_LIMIT_PER_CATEGORY=8
+EVAL_PIXEL_METRICS=false
+```
+
 ```bash
-RUN_MODE=smoke EVAL_LIMIT_PER_CATEGORY=8 EVAL_PIXEL_METRICS=false \
 bash scripts/run_server_mpdd.sh configs/server_mpdd.yaml configs/server_paths_mpdd.env
 ```
 
@@ -252,11 +281,19 @@ cp configs/server_paths_visa.example.env configs/server_paths_visa.env
 # Edit DATA_ROOT or FEW_SHOT_ROOT, OUTPUT_ROOT, DEVICE, and optional CHECKPOINT_PATH.
 ```
 
-Recommended ViSA few-shot run:
+Recommended ViSA few-shot run. Put these values in
+`configs/server_paths_visa.env` for the experiment:
+
+```dotenv
+FEW_SHOT_ROOT=/path/to/fewshot_visa_1cls
+RUN_MODE=full
+SEARCH_BUDGET=24
+EVAL_BATCH_SIZE=32
+EVAL_PIXEL_AUPRO=false
+```
 
 ```bash
-FEW_SHOT_ROOT=/path/to/fewshot_visa_1cls RUN_MODE=full SEARCH_BUDGET=24 EVAL_BATCH_SIZE=32 \
-EVAL_PIXEL_AUPRO=false bash scripts/run_server_visa.sh configs/server_visa.yaml configs/server_paths_visa.env
+bash scripts/run_server_visa.sh configs/server_visa.yaml configs/server_paths_visa.env
 ```
 
 ## Integration Notes

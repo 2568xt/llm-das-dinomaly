@@ -38,26 +38,47 @@ image-level score was evaluated against the same root's test split during
 training. Per-epoch evaluation is image-level by default so training remains
 fast; final evaluation keeps image metrics and pixel AUROC/AP/F1 enabled.
 
-Use the fast default while iterating:
+Use the fast default while iterating. Put temporary knobs in the server env file
+for the run, then execute the runner:
+
+```dotenv
+RUN_MODE=smoke
+EVAL_LIMIT_PER_CATEGORY=8
+EVAL_BATCH_SIZE=16
+EVAL_PIXEL_AUPRO=false
+```
 
 ```bash
-RUN_MODE=smoke EVAL_LIMIT_PER_CATEGORY=8 EVAL_BATCH_SIZE=16 EVAL_PIXEL_AUPRO=false \
 bash scripts/run_server_mvtec.sh configs/server_mvtec.yaml configs/server_paths.env
 ```
 
 Use full Dinomaly-style pixel AUPRO only for final parity reports:
 
+```dotenv
+RUN_MODE=full
+EVAL_BATCH_SIZE=16
+EVAL_RESIZE_MASK=256
+EVAL_PIXEL_METRICS=true
+EVAL_PIXEL_AUPRO=true
+```
+
 ```bash
-RUN_MODE=full EVAL_BATCH_SIZE=16 EVAL_RESIZE_MASK=256 EVAL_PIXEL_METRICS=true EVAL_PIXEL_AUPRO=true \
-python -m llm_das_dinomaly.pipelines.server_mvtec --config configs/server_mvtec.yaml --stage eval
+bash scripts/run_server_mvtec.sh configs/server_mvtec.yaml configs/server_paths.env eval
 ```
 
 For MPDD, use the MVTec-like server dataset layout and keep outputs separate
 from MVTec so cache context checks can do their job:
 
+```dotenv
+RUN_MODE=full
+MAX_SAMPLES=all
+SEARCH_BUDGET=24
+EVAL_BATCH_SIZE=32
+EVAL_PIXEL_AUPRO=false
+BASE_TRAIN_IF_MISSING=true
+```
+
 ```bash
-RUN_MODE=full MAX_SAMPLES=all SEARCH_BUDGET=24 EVAL_BATCH_SIZE=32 \
-EVAL_PIXEL_AUPRO=false BASE_TRAIN_IF_MISSING=true \
 bash scripts/run_server_mpdd.sh configs/server_mpdd.yaml configs/server_paths_mpdd.env
 ```
 
@@ -68,15 +89,33 @@ the same root's complete test set. Few-shot runs intentionally use shorter
 defaults than full-data training: `FEW_SHOT_BASE_TOTAL_ITERS=2000`,
 `FEW_SHOT_BASE_EVAL_INTERVAL=1000`, and `FEW_SHOT_ENHANCER_EPOCHS=10`.
 
+```dotenv
+FEW_SHOT_ROOT=/path/to/fewshot_root
+RUN_MODE=full
+SEARCH_BUDGET=24
+EVAL_BATCH_SIZE=32
+EVAL_PIXEL_AUPRO=false
+```
+
 ```bash
-FEW_SHOT_ROOT=/path/to/fewshot_root RUN_MODE=full SEARCH_BUDGET=24 EVAL_BATCH_SIZE=32 \
-EVAL_PIXEL_AUPRO=false bash scripts/run_server_mvtec.sh configs/server_mvtec.yaml configs/server_paths.env
+bash scripts/run_server_mvtec.sh configs/server_mvtec.yaml configs/server_paths.env
 ```
 
 For ViSA, prepare the dataset first with the official `1cls` split, then run the
 ViSA server entry point:
 
-```bash
-FEW_SHOT_ROOT=/path/to/fewshot_visa_1cls RUN_MODE=full SEARCH_BUDGET=24 EVAL_BATCH_SIZE=32 \
-EVAL_PIXEL_AUPRO=false bash scripts/run_server_visa.sh configs/server_visa.yaml configs/server_paths_visa.env
+```dotenv
+FEW_SHOT_ROOT=/path/to/fewshot_visa_1cls
+RUN_MODE=full
+SEARCH_BUDGET=24
+EVAL_BATCH_SIZE=32
+EVAL_PIXEL_AUPRO=false
 ```
+
+```bash
+bash scripts/run_server_visa.sh configs/server_visa.yaml configs/server_paths_visa.env
+```
+
+Every runner writes `OUTPUT_ROOT/effective_config.json`, which records the
+resolved YAML, final typed settings, env-file path, env-file keys, and any
+inline overrides. Use that file with `run_summary.json` when comparing runs.
