@@ -87,7 +87,8 @@ root. This root replaces `DATA_ROOT`, trains a new unified base checkpoint for
 the run, expands `train/good` into `0/90/180/270` normal views, and evaluates on
 the same root's complete test set. Few-shot runs intentionally use shorter
 defaults than full-data training: `FEW_SHOT_BASE_TOTAL_ITERS=2000`,
-`FEW_SHOT_BASE_EVAL_INTERVAL=1000`, and `FEW_SHOT_ENHANCER_EPOCHS=10`.
+`FEW_SHOT_BASE_EVAL_INTERVAL=1000`, `FEW_SHOT_ENHANCER_EPOCHS=1`,
+`FEW_SHOT_ENHANCER_HIDDEN_DIM=64`, and `FEW_SHOT_ENHANCER_LR=0.0001`.
 
 ```dotenv
 FEW_SHOT_ROOT=/path/to/fewshot_root
@@ -95,6 +96,9 @@ RUN_MODE=full
 SEARCH_BUDGET=24
 EVAL_BATCH_SIZE=32
 EVAL_PIXEL_AUPRO=false
+EVAL_FUSION_BETA=0.05
+EVAL_FUSION_BETA_SWEEP=0,0.01,0.05,0.1
+EVAL_BETA_SELECTION_METRIC=image_auroc
 ```
 
 ```bash
@@ -115,6 +119,25 @@ EVAL_PIXEL_AUPRO=false
 ```bash
 bash scripts/run_server_visa.sh configs/server_visa.yaml configs/server_paths_visa.env
 ```
+
+For enhancer-effectiveness claims, keep the primary beta fixed and use beta
+sweep as evidence rather than as an unbiased final selector:
+
+```dotenv
+EVAL_FUSION_BETA=0.05
+EVAL_FUSION_BETA_SWEEP=0,0.01,0.05,0.1
+EVAL_BETA_SELECTION_METRIC=image_auroc
+```
+
+After the run, generate the compact evidence table:
+
+```bash
+python scripts/summarize_enhancer_evidence.py "$OUTPUT_ROOT"
+```
+
+Report `diagnostic_best_beta` only as a diagnostic value selected on the eval
+set. For final claims, use the fixed primary beta or add a separate validation
+split before choosing beta.
 
 Every runner writes `OUTPUT_ROOT/effective_config.json`, which records the
 resolved YAML, final typed settings, env-file path, env-file keys, and any

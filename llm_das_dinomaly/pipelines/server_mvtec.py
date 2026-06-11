@@ -84,6 +84,8 @@ RUN_ENV_VARS = (
     "FEW_SHOT_BASE_TOTAL_ITERS",
     "FEW_SHOT_BASE_EVAL_INTERVAL",
     "FEW_SHOT_ENHANCER_EPOCHS",
+    "FEW_SHOT_ENHANCER_HIDDEN_DIM",
+    "FEW_SHOT_ENHANCER_LR",
     "MAX_SAMPLES",
     "SEARCH_BUDGET",
     "HARD_SAMPLE_SHARD_SIZE",
@@ -103,6 +105,8 @@ RUN_ENV_VARS = (
     "EVAL_PIXEL_AUPRO",
     "EVAL_EPOCH_PIXEL_METRICS",
     "EVAL_FUSION_BETA",
+    "EVAL_FUSION_BETA_SWEEP",
+    "EVAL_BETA_SELECTION_METRIC",
 )
 
 
@@ -192,6 +196,10 @@ def run_pipeline(cfg: Dict[str, Any], *, stage: str = "all", run_metadata: Optio
         none_values={"none", "all", "-1"},
     )
     eval_beta = float(eval_cfg.get("beta", 1.0))
+    eval_beta_sweep = _resolve_beta_sweep(eval_cfg.get("beta_sweep"), primary_beta=eval_beta)
+    eval_beta_selection_metric = _resolve_beta_selection_metric(
+        eval_cfg.get("beta_selection_metric", "image_auroc")
+    )
     eval_pixel_metrics = _as_bool(eval_cfg.get("pixel_metrics", True))
     eval_pixel_aupro = _as_bool(eval_cfg.get("pixel_aupro", False))
     eval_epoch_pixel_metrics = _as_bool(eval_cfg.get("epoch_pixel_metrics", False))
@@ -279,6 +287,8 @@ def run_pipeline(cfg: Dict[str, Any], *, stage: str = "all", run_metadata: Optio
             "base_total_iters": int(base_cfg.get("total_iters", 10000)),
             "base_eval_interval": int(base_cfg.get("eval_interval", 5000)),
             "enhancer_epochs": int(enhancer_cfg.get("epochs", 1)),
+            "enhancer_hidden_dim": int(enhancer_cfg.get("hidden_dim", 128)),
+            "enhancer_lr": float(enhancer_cfg.get("lr", 1e-3)),
         },
         "hard_samples": {
             "search_budget": hard_search_budget,
@@ -304,6 +314,8 @@ def run_pipeline(cfg: Dict[str, Any], *, stage: str = "all", run_metadata: Optio
             "pixel_aupro": eval_pixel_aupro,
             "epoch_pixel_metrics": eval_epoch_pixel_metrics,
             "beta": eval_beta,
+            "beta_sweep": eval_beta_sweep,
+            "beta_selection_metric": eval_beta_selection_metric,
         },
     }
     run_config = _build_run_config(
@@ -342,6 +354,8 @@ def run_pipeline(cfg: Dict[str, Any], *, stage: str = "all", run_metadata: Optio
                 "base_total_iters": int(base_cfg.get("total_iters", 10000)),
                 "base_eval_interval": int(base_cfg.get("eval_interval", 5000)),
                 "enhancer_epochs": int(enhancer_cfg.get("epochs", 1)),
+                "enhancer_hidden_dim": int(enhancer_cfg.get("hidden_dim", 128)),
+                "enhancer_lr": float(enhancer_cfg.get("lr", 1e-3)),
             },
         },
     }
@@ -423,6 +437,8 @@ def run_pipeline(cfg: Dict[str, Any], *, stage: str = "all", run_metadata: Optio
                     resize_mask=eval_resize_mask,
                     limit_per_category=eval_limit_per_category,
                     beta=eval_beta,
+                    beta_sweep=eval_beta_sweep,
+                    beta_selection_metric=eval_beta_selection_metric,
                     metrics_dir=metrics_dir,
                     name="eval_enhanced",
                     enhancer_head=enhancer_head,
@@ -518,6 +534,8 @@ def run_pipeline(cfg: Dict[str, Any], *, stage: str = "all", run_metadata: Optio
                         resize_mask=eval_resize_mask,
                         limit_per_category=eval_limit_per_category,
                         beta=eval_beta,
+                        beta_sweep=eval_beta_sweep,
+                        beta_selection_metric=eval_beta_selection_metric,
                         metrics_dir=metrics_dir,
                         name=f"enhancer_epoch_{int(epoch):04d}",
                         enhancer_head=head,
@@ -555,6 +573,8 @@ def run_pipeline(cfg: Dict[str, Any], *, stage: str = "all", run_metadata: Optio
                 resize_mask=eval_resize_mask,
                 limit_per_category=eval_limit_per_category,
                 beta=eval_beta,
+                beta_sweep=eval_beta_sweep,
+                beta_selection_metric=eval_beta_selection_metric,
                 metrics_dir=metrics_dir,
                 name="final_enhanced_eval",
                 enhancer_head=enhancer_head,
@@ -603,6 +623,10 @@ def _apply_few_shot_training_budget(
         base_out["eval_interval"] = few_shot_cfg["base_eval_interval"]
     if "enhancer_epochs" in few_shot_cfg:
         enhancer_out["epochs"] = few_shot_cfg["enhancer_epochs"]
+    if "enhancer_hidden_dim" in few_shot_cfg:
+        enhancer_out["hidden_dim"] = few_shot_cfg["enhancer_hidden_dim"]
+    if "enhancer_lr" in few_shot_cfg:
+        enhancer_out["lr"] = few_shot_cfg["enhancer_lr"]
     return base_out, enhancer_out
 
 
@@ -1735,6 +1759,8 @@ def _run_and_write_evaluation(
     beta: float,
     metrics_dir: Path,
     name: str,
+    beta_sweep: Optional[Sequence[float]] = None,
+    beta_selection_metric: str = "image_auroc",
     enhancer_head: Optional[MapFeatureHead] = None,
     fusion_calibration: Optional[Dict[str, Any]] = None,
     num_workers: int = 0,
@@ -1764,6 +1790,8 @@ def _run_and_write_evaluation(
         resize_mask=resize_mask,
         enhancer_head=enhancer_head,
         beta=beta,
+        beta_sweep=beta_sweep if enhancer_head is not None else None,
+        beta_selection_metric=beta_selection_metric,
         base_normalizer=base_normalizer,
         aux_normalizer=aux_normalizer,
         limit_per_category=limit_per_category,
@@ -1776,6 +1804,12 @@ def _run_and_write_evaluation(
         test_dataset_cls=test_dataset_cls,
     )
     write_metric_json(metrics_dir / f"{name}.json", payload)
+    sweep_payload = _beta_sweep_artifact(name, payload)
+    if sweep_payload is not None:
+        write_metric_json(metrics_dir / f"{name}_beta_sweep.json", sweep_payload)
+        alias_name = _beta_sweep_alias_name(name)
+        if alias_name is not None:
+            write_metric_json(metrics_dir / alias_name, sweep_payload)
     return payload
 
 
@@ -1881,6 +1915,84 @@ def _json_ready(value: Any) -> Any:
 def _write_json(path: Path, payload: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _resolve_beta_sweep(value: Any, *, primary_beta: float) -> Optional[List[float]]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped or stripped.lower() in {"none", "false", "off"}:
+            return None
+        raw_values: Sequence[Any] = [item.strip() for item in stripped.split(",")]
+    elif isinstance(value, (list, tuple)):
+        raw_values = value
+    else:
+        raw_values = [value]
+
+    betas = [0.0, float(primary_beta)]
+    for raw in raw_values:
+        if raw is None or str(raw).strip() == "":
+            continue
+        try:
+            betas.append(float(raw))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid EVAL_FUSION_BETA_SWEEP value: {raw!r}") from exc
+
+    out: List[float] = []
+    seen = set()
+    for beta in sorted(betas):
+        key = _beta_key(beta)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(float(beta))
+    return out
+
+
+def _resolve_beta_selection_metric(value: Any) -> str:
+    metric = str(value or "image_auroc").strip()
+    allowed = {"image_auroc", "image_ap", "image_f1"}
+    if metric not in allowed:
+        expected = ", ".join(sorted(allowed))
+        raise ValueError(f"EVAL_BETA_SELECTION_METRIC must be one of: {expected}")
+    return metric
+
+
+def _beta_key(beta: float) -> str:
+    return f"{float(beta):.6g}"
+
+
+def _beta_sweep_artifact(metric_name: str, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    mean = payload.get("mean", {})
+    if "enhanced_by_beta" not in mean:
+        return None
+    categories: Dict[str, Any] = {}
+    for category, summary in payload.get("categories", {}).items():
+        if "enhanced_by_beta" not in summary:
+            continue
+        categories[category] = {
+            "baseline": summary.get("baseline"),
+            "enhanced_by_beta": summary.get("enhanced_by_beta"),
+            "beta_sweep": summary.get("beta_sweep"),
+        }
+    return {
+        "metric_name": metric_name,
+        "categories": categories,
+        "mean": {
+            "baseline": mean.get("baseline"),
+            "enhanced_by_beta": mean.get("enhanced_by_beta"),
+            "beta_sweep": mean.get("beta_sweep"),
+        },
+    }
+
+
+def _beta_sweep_alias_name(metric_name: str) -> Optional[str]:
+    if metric_name == "final_enhanced_eval":
+        return "final_enhanced_beta_sweep.json"
+    if metric_name == "eval_enhanced":
+        return "eval_beta_sweep.json"
+    return None
 
 
 def _resolve_max_samples(value: Any, *, mode: str) -> int:

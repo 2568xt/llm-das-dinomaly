@@ -17,6 +17,9 @@ from llm_das_dinomaly.evaluation.metrics import metric_bundle, pixel_aupro
 from llm_das_dinomaly.utils import ProgressBar
 
 
+IMAGE_METRIC_KEYS = ("image_auroc", "image_ap", "image_f1")
+
+
 def evaluate_mvtec_detector(
     wrapper,
     data_root,
@@ -27,6 +30,8 @@ def evaluate_mvtec_detector(
     resize_mask: Optional[int],
     enhancer_head: Optional[torch.nn.Module] = None,
     beta: float = 1.0,
+    beta_sweep: Optional[Sequence[float]] = None,
+    beta_selection_metric: str = "image_auroc",
     base_normalizer: Optional[ScoreNormalizer] = None,
     aux_normalizer: Optional[ScoreNormalizer] = None,
     limit_per_category: Optional[int] = None,
@@ -53,6 +58,8 @@ def evaluate_mvtec_detector(
             resize_mask=resize_mask,
             enhancer_head=enhancer_head,
             beta=beta,
+            beta_sweep=beta_sweep,
+            beta_selection_metric=beta_selection_metric,
             base_normalizer=base_normalizer,
             aux_normalizer=aux_normalizer,
             category=category,
@@ -101,6 +108,8 @@ def _evaluate_category(
     resize_mask: Optional[int],
     enhancer_head: Optional[torch.nn.Module],
     beta: float,
+    beta_sweep: Optional[Sequence[float]],
+    beta_selection_metric: str,
     base_normalizer: Optional[ScoreNormalizer],
     aux_normalizer: Optional[ScoreNormalizer],
     category: str,
@@ -213,20 +222,36 @@ def _evaluate_category(
 
     if aux_scores:
         aux_tensor = torch.cat(aux_scores)
-        fused = fuse_scores(
-            base_tensor.float(),
-            aux_tensor.float(),
+        summary["enhanced"] = _enhanced_metrics_for_beta(
+            label_array,
+            base_tensor,
+            aux_tensor,
             beta=beta,
             base_normalizer=base_normalizer,
             aux_normalizer=aux_normalizer,
-        ).numpy()
-        enhanced_image = metric_bundle(label_array, fused)
-        summary["enhanced"] = {
-            "image_auroc": enhanced_image["auroc"],
-            "image_ap": enhanced_image["ap"],
-            "image_f1": enhanced_image["f1"],
-            "pixel_source": "base_dinomaly_map",
-        }
+        )
+
+        sweep_betas = _normalize_beta_grid(beta_sweep, primary_beta=beta)
+        if sweep_betas:
+            enhanced_by_beta: Dict[str, Any] = {}
+            for sweep_beta in sweep_betas:
+                metrics = _enhanced_metrics_for_beta(
+                    label_array,
+                    base_tensor,
+                    aux_tensor,
+                    beta=sweep_beta,
+                    base_normalizer=base_normalizer,
+                    aux_normalizer=aux_normalizer,
+                )
+                metrics["delta_vs_baseline"] = _metric_delta(metrics, baseline_metrics)
+                enhanced_by_beta[_beta_key(sweep_beta)] = metrics
+            summary["enhanced_by_beta"] = enhanced_by_beta
+            summary["beta_sweep"] = _beta_sweep_summary(
+                enhanced_by_beta,
+                selection_metric=beta_selection_metric,
+                primary_beta=beta,
+                baseline_metrics=baseline_metrics,
+            )
 
     return summary
 
@@ -263,6 +288,19 @@ def _mean_category_metrics(category_summaries: Dict[str, Any]) -> Dict[str, Any]
     enhanced = [summary for summary in category_summaries.values() if "enhanced" in summary]
     if enhanced:
         out["enhanced"] = _mean_named_metrics(enhanced, section="enhanced")
+    enhanced_by_beta = [
+        summary for summary in category_summaries.values() if "enhanced_by_beta" in summary
+    ]
+    if enhanced_by_beta:
+        out["enhanced_by_beta"] = _mean_enhanced_by_beta(
+            enhanced_by_beta,
+            baseline_metrics=out["baseline"],
+        )
+        out["beta_sweep"] = _mean_beta_sweep_summary(
+            category_summaries,
+            enhanced_by_beta=out["enhanced_by_beta"],
+            baseline_metrics=out["baseline"],
+        )
     return out
 
 
@@ -278,6 +316,216 @@ def _mean_named_metrics(summaries: Iterable[Dict[str, Any]], *, section: str) ->
 
 def _is_meanable(value: Any) -> bool:
     return value is None or (isinstance(value, (float, int)) and not isinstance(value, bool))
+
+
+def _enhanced_metrics_for_beta(
+    labels: np.ndarray,
+    base_scores: torch.Tensor,
+    aux_scores: torch.Tensor,
+    *,
+    beta: float,
+    base_normalizer: Optional[ScoreNormalizer],
+    aux_normalizer: Optional[ScoreNormalizer],
+) -> Dict[str, Any]:
+    fused = fuse_scores(
+        base_scores.float(),
+        aux_scores.float(),
+        beta=float(beta),
+        base_normalizer=base_normalizer,
+        aux_normalizer=aux_normalizer,
+    ).numpy()
+    enhanced_image = metric_bundle(labels, fused)
+    return {
+        "image_auroc": enhanced_image["auroc"],
+        "image_ap": enhanced_image["ap"],
+        "image_f1": enhanced_image["f1"],
+        "pixel_source": "base_dinomaly_map",
+    }
+
+
+def _normalize_beta_grid(
+    beta_sweep: Optional[Sequence[float]],
+    *,
+    primary_beta: float,
+) -> List[float]:
+    if beta_sweep is None:
+        return []
+    values = [0.0, float(primary_beta)]
+    values.extend(float(beta) for beta in beta_sweep)
+    out: List[float] = []
+    seen = set()
+    for value in values:
+        key = _beta_key(value)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(float(value))
+    return sorted(out)
+
+
+def _beta_key(beta: float) -> str:
+    return f"{float(beta):.6g}"
+
+
+def _metric_delta(metrics: Dict[str, Any], baseline_metrics: Dict[str, Any]) -> Dict[str, Optional[float]]:
+    delta: Dict[str, Optional[float]] = {}
+    for key in IMAGE_METRIC_KEYS:
+        value = metrics.get(key)
+        baseline = baseline_metrics.get(key)
+        if isinstance(value, (float, int)) and isinstance(baseline, (float, int)):
+            delta[key] = float(value) - float(baseline)
+        else:
+            delta[key] = None
+    return delta
+
+
+def _beta_sweep_summary(
+    enhanced_by_beta: Dict[str, Dict[str, Any]],
+    *,
+    selection_metric: str,
+    primary_beta: float,
+    baseline_metrics: Dict[str, Any],
+) -> Dict[str, Any]:
+    best = _diagnostic_best_beta(
+        enhanced_by_beta,
+        selection_metric=selection_metric,
+        baseline_metrics=baseline_metrics,
+    )
+    return {
+        "betas": [
+            {
+                "key": key,
+                "beta": float(key),
+                "is_primary": key == _beta_key(primary_beta),
+            }
+            for key in _sorted_beta_keys(enhanced_by_beta)
+        ],
+        "primary_beta": float(primary_beta),
+        "primary_beta_key": _beta_key(primary_beta),
+        "selection_metric": selection_metric,
+        "diagnostic_best_beta": best,
+        "diagnostic": True,
+        "diagnostic_note": (
+            "best_beta is selected on this evaluation set and should not be reported "
+            "as an unbiased final result without a separate validation protocol"
+        ),
+    }
+
+
+def _mean_enhanced_by_beta(
+    summaries: Iterable[Dict[str, Any]],
+    *,
+    baseline_metrics: Dict[str, Any],
+) -> Dict[str, Any]:
+    summary_list = list(summaries)
+    beta_keys = _sorted_beta_keys(
+        {
+            key: {}
+            for summary in summary_list
+            for key in summary.get("enhanced_by_beta", {})
+        }
+    )
+    out: Dict[str, Any] = {}
+    for key in beta_keys:
+        rows = [
+            summary["enhanced_by_beta"][key]
+            for summary in summary_list
+            if key in summary.get("enhanced_by_beta", {})
+        ]
+        mean_metrics = _mean_metric_rows(rows)
+        mean_metrics["delta_vs_baseline"] = _metric_delta(mean_metrics, baseline_metrics)
+        out[key] = mean_metrics
+    return out
+
+
+def _mean_metric_rows(rows: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
+    row_list = list(rows)
+    result: Dict[str, Any] = {"num_categories": len(row_list)}
+    keys = sorted({key for row in row_list for key, value in row.items() if _is_meanable(value)})
+    for key in keys:
+        values = [float(row[key]) for row in row_list if isinstance(row.get(key), (float, int))]
+        result[key] = None if not values else float(np.mean(values))
+    return result
+
+
+def _mean_beta_sweep_summary(
+    category_summaries: Dict[str, Any],
+    *,
+    enhanced_by_beta: Dict[str, Dict[str, Any]],
+    baseline_metrics: Dict[str, Any],
+) -> Dict[str, Any]:
+    first_sweep = next(
+        (
+            summary["beta_sweep"]
+            for summary in category_summaries.values()
+            if "beta_sweep" in summary
+        ),
+        {},
+    )
+    selection_metric = str(first_sweep.get("selection_metric", "image_auroc"))
+    primary_beta = float(first_sweep.get("primary_beta", 1.0))
+    counts = {
+        key: _category_delta_counts(category_summaries, beta_key=key, metric=selection_metric)
+        for key in _sorted_beta_keys(enhanced_by_beta)
+    }
+    summary = _beta_sweep_summary(
+        enhanced_by_beta,
+        selection_metric=selection_metric,
+        primary_beta=primary_beta,
+        baseline_metrics=baseline_metrics,
+    )
+    summary["category_delta_counts"] = counts
+    return summary
+
+
+def _diagnostic_best_beta(
+    enhanced_by_beta: Dict[str, Dict[str, Any]],
+    *,
+    selection_metric: str,
+    baseline_metrics: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    candidates = []
+    for key in _sorted_beta_keys(enhanced_by_beta):
+        value = enhanced_by_beta[key].get(selection_metric)
+        if isinstance(value, (float, int)):
+            candidates.append((float(value), key))
+    if not candidates:
+        return None
+    value, key = max(candidates, key=lambda item: (item[0], -abs(float(item[1]))))
+    baseline = baseline_metrics.get(selection_metric)
+    delta = float(value) - float(baseline) if isinstance(baseline, (float, int)) else None
+    return {
+        "key": key,
+        "beta": float(key),
+        "selection_metric": selection_metric,
+        "value": float(value),
+        "delta_vs_baseline": delta,
+    }
+
+
+def _category_delta_counts(
+    category_summaries: Dict[str, Any],
+    *,
+    beta_key: str,
+    metric: str,
+) -> Dict[str, int]:
+    counts = {"positive": 0, "negative": 0, "zero": 0, "missing": 0}
+    for summary in category_summaries.values():
+        delta = summary.get("enhanced_by_beta", {}).get(beta_key, {}).get("delta_vs_baseline", {}).get(metric)
+        if delta is None:
+            counts["missing"] += 1
+        elif delta > 0:
+            counts["positive"] += 1
+        elif delta < 0:
+            counts["negative"] += 1
+        else:
+            counts["zero"] += 1
+    counts["num_categories"] = sum(counts.values())
+    return counts
+
+
+def _sorted_beta_keys(mapping: Dict[str, Any]) -> List[str]:
+    return sorted(mapping, key=lambda key: float(key))
 
 
 def _module_device(module: torch.nn.Module) -> torch.device:

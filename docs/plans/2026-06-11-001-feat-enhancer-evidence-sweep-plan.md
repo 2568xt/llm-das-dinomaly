@@ -1,7 +1,7 @@
 ---
 title: "feat: Add enhancer evidence sweep"
 type: feat
-status: active
+status: completed
 date: 2026-06-11
 origin: docs/brainstorms/2026-06-08-few-shot-rotation-augmentation-requirements.md
 ---

@@ -101,8 +101,12 @@ Optional environment overrides:
   `BASE_TOTAL_ITERS` only when `FEW_SHOT_ROOT` is set.
 - `FEW_SHOT_BASE_EVAL_INTERVAL`: defaults to `1000` and overrides
   `BASE_EVAL_INTERVAL` only when `FEW_SHOT_ROOT` is set.
-- `FEW_SHOT_ENHANCER_EPOCHS`: defaults to `10` and overrides
+- `FEW_SHOT_ENHANCER_EPOCHS`: defaults to `1` and overrides
   `ENHANCER_EPOCHS` only when `FEW_SHOT_ROOT` is set.
+- `FEW_SHOT_ENHANCER_HIDDEN_DIM`: defaults to `64` and overrides
+  `ENHANCER_HIDDEN_DIM` only when `FEW_SHOT_ROOT` is set.
+- `FEW_SHOT_ENHANCER_LR`: defaults to `0.0001` and overrides
+  `ENHANCER_LR` only when `FEW_SHOT_ROOT` is set.
 - `BASE_CHECKPOINT_DIR`: defaults to `OUTPUT_ROOT/base_checkpoints`.
 - `MAX_SAMPLES`: defaults to `4`; use `all` for a full run.
 - `SEARCH_BUDGET`: defaults to `4`.
@@ -129,6 +133,13 @@ Optional environment overrides:
   Dinomaly's reported pixel AUPRO.
 - `EVAL_EPOCH_PIXEL_METRICS`: defaults to `false` so per-epoch enhancer
   evaluations stay image-level and fast.
+- `EVAL_FUSION_BETA`: primary enhancer fusion beta used by the existing
+  `enhanced` fields.
+- `EVAL_FUSION_BETA_SWEEP`: optional comma-separated beta grid, for example
+  `0,0.01,0.05,0.1`. When set, enhanced eval computes all betas from one
+  detector/enhancer forward pass and writes beta-sweep evidence.
+- `EVAL_BETA_SELECTION_METRIC`: defaults to `image_auroc`; allowed values are
+  `image_auroc`, `image_ap`, and `image_f1`.
 
 The run writes `effective_config.json`, `hard_samples.pt`, `enhancer.pt`,
 `run_summary.json`, and evaluation metrics under `OUTPUT_ROOT`.
@@ -148,9 +159,13 @@ Metrics are written under `OUTPUT_ROOT/metrics/`, including
 `baseline_eval.json`, `enhancer_epochs.jsonl`, per-epoch files such as
 `enhancer_epoch_0001.json`, and `final_enhanced_eval.json`. Eval-only runs write
 `eval_summary.json` and, when an enhancer checkpoint exists,
-`eval_enhanced.json`. During long evaluations, category-level partial results
-are also written to matching `*.progress.json` files so server logs can be
-tailed without guessing whether eval is still moving:
+`eval_enhanced.json`. When `EVAL_FUSION_BETA_SWEEP` is set, enhanced eval also
+writes companion files such as `final_enhanced_eval_beta_sweep.json`,
+`final_enhanced_beta_sweep.json`, `eval_enhanced_beta_sweep.json`,
+`eval_beta_sweep.json`, and per-epoch `enhancer_epoch_0001_beta_sweep.json`.
+During long evaluations, category-level partial results are also written to
+matching `*.progress.json` files so server logs can be tailed without guessing
+whether eval is still moving:
 
 ```bash
 python -m llm_das_dinomaly.pipelines.server_mvtec --config configs/server_mvtec.yaml --stage eval
@@ -188,6 +203,32 @@ for train-only smoke runs. Per-epoch enhancer evaluation is image-level by
 default; set `EVAL_EPOCH_PIXEL_METRICS=true` only when the extra pixel-metric
 cost is intentional.
 
+### Enhancer Evidence Mode
+
+For tracked enhancer experiments, put the sweep and few-shot knobs in the env
+file, not in a one-off shell prefix:
+
+```dotenv
+FEW_SHOT_ENHANCER_EPOCHS=1
+FEW_SHOT_ENHANCER_HIDDEN_DIM=64
+FEW_SHOT_ENHANCER_LR=0.0001
+EVAL_FUSION_BETA=0.05
+EVAL_FUSION_BETA_SWEEP=0,0.01,0.05,0.1
+EVAL_BETA_SELECTION_METRIC=image_auroc
+```
+
+After the run, summarize the evidence:
+
+```bash
+python scripts/summarize_enhancer_evidence.py "$OUTPUT_ROOT"
+```
+
+The script writes `metrics/enhancer_evidence_summary.json` and
+`metrics/enhancer_evidence_summary.csv`. Treat `diagnostic_best_beta` as a
+diagnostic signal selected on the eval set; for a final unbiased claim, report a
+fixed beta chosen before the final test run or introduce a separate validation
+protocol.
+
 ## Few-Shot Rotation Runs
 
 Set `FEW_SHOT_ROOT` when you want a few-shot experiment. The directory must be a
@@ -201,8 +242,9 @@ In few-shot mode, `CHECKPOINT_PATH` is ignored for base-checkpoint reuse. The
 DINOv2 pretrained encoder from the official Dinomaly recipe is still used; the
 new checkpoint is the Dinomaly reconstruction model for this few-shot root.
 Few-shot runs use shorter training defaults than full-data runs:
-`FEW_SHOT_BASE_TOTAL_ITERS=2000`, `FEW_SHOT_BASE_EVAL_INTERVAL=1000`, and
-`FEW_SHOT_ENHANCER_EPOCHS=10`.
+`FEW_SHOT_BASE_TOTAL_ITERS=2000`, `FEW_SHOT_BASE_EVAL_INTERVAL=1000`,
+`FEW_SHOT_ENHANCER_EPOCHS=1`, `FEW_SHOT_ENHANCER_HIDDEN_DIM=64`, and
+`FEW_SHOT_ENHANCER_LR=0.0001`.
 
 Example MVTec few-shot run. Edit these values into
 `configs/server_paths.env`, then run the script without a shell prefix:
@@ -213,6 +255,9 @@ RUN_MODE=full
 SEARCH_BUDGET=24
 EVAL_BATCH_SIZE=32
 EVAL_PIXEL_AUPRO=false
+EVAL_FUSION_BETA=0.05
+EVAL_FUSION_BETA_SWEEP=0,0.01,0.05,0.1
+EVAL_BETA_SELECTION_METRIC=image_auroc
 ```
 
 ```bash

@@ -66,7 +66,11 @@ def test_server_visa_config_allows_empty_checkpoint_env(tmp_path):
     assert cfg["base_training"]["train_if_missing"] == "true"
     assert cfg["few_shot_training"]["base_total_iters"] == "2000"
     assert cfg["few_shot_training"]["base_eval_interval"] == "1000"
-    assert cfg["few_shot_training"]["enhancer_epochs"] == "10"
+    assert cfg["few_shot_training"]["enhancer_epochs"] == "1"
+    assert cfg["few_shot_training"]["enhancer_hidden_dim"] == "64"
+    assert cfg["few_shot_training"]["enhancer_lr"] == "0.0001"
+    assert cfg["evaluation"]["beta_sweep"] == ""
+    assert cfg["evaluation"]["beta_selection_metric"] == "image_auroc"
 
 
 def test_mvtec_train_good_indexer(tmp_path):
