@@ -188,6 +188,42 @@ def test_evaluate_mvtec_detector_restores_enhancer_module_modes(tmp_path):
     assert enhancer.probe.training is False
 
 
+def test_evaluate_mvtec_detector_beta_sweep_reuses_single_forward(tmp_path):
+    data_root = _fake_mvtec_test(tmp_path / "mvtec")
+    model = CountingEvalDinomaly()
+    wrapper = ExtractFailWrapper(
+        model,
+        DinomalyConfig(image_size=32, crop_size=28, patch_size=7, gaussian_kernel=3, resize_mask=16),
+    )
+    enhancer = TrackingEnhancer()
+
+    summary = evaluate_mvtec_detector(
+        wrapper,
+        data_root,
+        categories=["bottle"],
+        batch_size=2,
+        device="cpu",
+        resize_mask=16,
+        enhancer_head=enhancer,
+        beta=0.05,
+        beta_sweep=[0.1],
+        beta_selection_metric="image_auroc",
+    )
+
+    bottle = summary["categories"]["bottle"]
+    assert model.forward_calls == 1
+    assert set(bottle["enhanced_by_beta"]) == {"0", "0.05", "0.1"}
+    assert np.isclose(
+        bottle["enhanced_by_beta"]["0"]["image_auroc"],
+        bottle["baseline"]["image_auroc"],
+    )
+    assert bottle["enhanced_by_beta"]["0"]["delta_vs_baseline"]["image_auroc"] == 0.0
+    assert bottle["beta_sweep"]["primary_beta_key"] == "0.05"
+    assert bottle["beta_sweep"]["diagnostic_best_beta"]["selection_metric"] == "image_auroc"
+    assert summary["mean"]["beta_sweep"]["primary_beta_key"] == "0.05"
+    assert "0.1" in summary["mean"]["beta_sweep"]["category_delta_counts"]
+
+
 def test_mean_category_metrics_averages_numeric_values_only():
     summary = _mean_category_metrics(
         {

@@ -14,6 +14,8 @@ from llm_das_dinomaly.pipelines.server_mvtec import (
     _collect_run_metadata,
     _initialize_trainable_layers_then_move,
     _maybe_disable_legacy_cuda_fusers,
+    _resolve_beta_selection_metric,
+    _resolve_beta_sweep,
     _try_summarize_enhancer_checkpoint,
     _try_summarize_hard_cache,
     generate_hard_samples,
@@ -140,12 +142,15 @@ def test_collect_run_metadata_records_env_sources():
         env={
             "LLM_DAS_RUNNER": "run_server_visa.sh",
             "LLM_DAS_ENV_FILE": "configs/server_paths_visa.env",
-            "LLM_DAS_ENV_FILE_OVERRIDES": "FEW_SHOT_ROOT,OUTPUT_ROOT,FEW_SHOT_BASE_TOTAL_ITERS",
-            "LLM_DAS_INLINE_OVERRIDES": "FEW_SHOT_BASE_TOTAL_ITERS,EVAL_BATCH_SIZE",
+            "LLM_DAS_ENV_FILE_OVERRIDES": "FEW_SHOT_ROOT,OUTPUT_ROOT,FEW_SHOT_BASE_TOTAL_ITERS,FEW_SHOT_ENHANCER_HIDDEN_DIM",
+            "LLM_DAS_INLINE_OVERRIDES": "FEW_SHOT_BASE_TOTAL_ITERS,EVAL_BATCH_SIZE,EVAL_FUSION_BETA_SWEEP,EVAL_BETA_SELECTION_METRIC",
             "FEW_SHOT_ROOT": "/data/fewshot",
             "OUTPUT_ROOT": "/data/out",
             "FEW_SHOT_BASE_TOTAL_ITERS": "1000",
+            "FEW_SHOT_ENHANCER_HIDDEN_DIM": "64",
             "EVAL_BATCH_SIZE": "32",
+            "EVAL_FUSION_BETA_SWEEP": "0,0.05",
+            "EVAL_BETA_SELECTION_METRIC": "image_ap",
         },
     )
 
@@ -155,14 +160,33 @@ def test_collect_run_metadata_records_env_sources():
         "FEW_SHOT_ROOT",
         "OUTPUT_ROOT",
         "FEW_SHOT_BASE_TOTAL_ITERS",
+        "FEW_SHOT_ENHANCER_HIDDEN_DIM",
     ]
-    assert metadata["inline_override_names"] == ["FEW_SHOT_BASE_TOTAL_ITERS", "EVAL_BATCH_SIZE"]
+    assert metadata["inline_override_names"] == [
+        "FEW_SHOT_BASE_TOTAL_ITERS",
+        "EVAL_BATCH_SIZE",
+        "EVAL_FUSION_BETA_SWEEP",
+        "EVAL_BETA_SELECTION_METRIC",
+    ]
     assert metadata["override_values"] == {
         "FEW_SHOT_ROOT": "/data/fewshot",
         "OUTPUT_ROOT": "/data/out",
         "FEW_SHOT_BASE_TOTAL_ITERS": "1000",
+        "FEW_SHOT_ENHANCER_HIDDEN_DIM": "64",
         "EVAL_BATCH_SIZE": "32",
+        "EVAL_FUSION_BETA_SWEEP": "0,0.05",
+        "EVAL_BETA_SELECTION_METRIC": "image_ap",
     }
+
+
+def test_beta_sweep_parsing_normalizes_and_rejects_invalid_values():
+    assert _resolve_beta_sweep("0.1,0.05,0.1", primary_beta=0.05) == [0.0, 0.05, 0.1]
+    assert _resolve_beta_sweep("", primary_beta=0.05) is None
+    assert _resolve_beta_selection_metric("image_ap") == "image_ap"
+    with pytest.raises(ValueError, match="invalid EVAL_FUSION_BETA_SWEEP"):
+        _resolve_beta_sweep("0.1,nope", primary_beta=0.05)
+    with pytest.raises(ValueError, match="EVAL_BETA_SELECTION_METRIC"):
+        _resolve_beta_selection_metric("pixel_auroc")
 
 
 def test_server_pipeline_reports_missing_checkpoint(tmp_path):
@@ -529,7 +553,13 @@ def test_few_shot_all_stage_trains_new_base_and_generates_rotated_hard_samples(t
             },
             "model": {"dinomaly_root": str(dinomaly_root), "checkpoint_path": str(old_checkpoint)},
             "base_training": {"checkpoint_dir": str(tmp_path / "base"), "total_iters": 999, "eval_interval": 333},
-            "few_shot_training": {"base_total_iters": 12, "base_eval_interval": 6, "enhancer_epochs": 2},
+            "few_shot_training": {
+                "base_total_iters": 12,
+                "base_eval_interval": 6,
+                "enhancer_epochs": 2,
+                "enhancer_hidden_dim": 64,
+                "enhancer_lr": 0.0001,
+            },
             "hard_samples": {"search_budget": 1, "max_samples": 1, "shard_size": 4},
             "enhancer": {"epochs": 99, "hidden_dim": 4},
             "evaluation": {"enabled": False},
@@ -542,10 +572,14 @@ def test_few_shot_all_stage_trains_new_base_and_generates_rotated_hard_samples(t
     assert base_calls[0]["total_iters"] == 12
     assert base_calls[0]["eval_interval"] == 6
     assert enhancer_calls[0]["epochs"] == 2
+    assert enhancer_calls[0]["hidden_dim"] == 64
+    assert enhancer_calls[0]["lr"] == 0.0001
     assert summary["few_shot"]["training_budget"] == {
         "base_total_iters": 12,
         "base_eval_interval": 6,
         "enhancer_epochs": 2,
+        "enhancer_hidden_dim": 64,
+        "enhancer_lr": 0.0001,
     }
     assert summary["base_checkpoint"]["source"] == "few_shot_trained"
     assert summary["base_checkpoint"]["ignored_checkpoint_path"] == str(old_checkpoint)
@@ -791,6 +825,58 @@ def test_server_pipeline_eval_stage_writes_metrics(tmp_path, monkeypatch):
     assert (tmp_path / "out" / "metrics" / "eval_summary.progress.json").exists()
 
 
+def test_server_pipeline_eval_stage_writes_enhancer_beta_sweep(tmp_path, monkeypatch):
+    data_root = _fake_mvtec(tmp_path / "mvtec")
+    _fake_mvtec_test(data_root)
+    checkpoint = tmp_path / "model.pth"
+    checkpoint.write_bytes(b"not-used-by-dummy-wrapper")
+    dinomaly_root = tmp_path / "Dinomaly"
+    dinomaly_root.mkdir()
+    output_root = tmp_path / "out"
+    head = MapFeatureHead(input_dim=18, hidden_dim=4)
+    save_torch_payload(
+        output_root / "enhancer.pt",
+        {
+            "state_dict": head.state_dict(),
+            "input_dim": 18,
+            "hidden_dim": 4,
+            "epochs": 1,
+            "losses": [0.2],
+            "fusion_calibration": {
+                "base": {"lo": 0.0, "hi": 1.0},
+                "aux": {"lo": 0.0, "hi": 1.0},
+            },
+            "cache_context": _expected_cache_context(data_root, checkpoint),
+        },
+    )
+
+    def build_dummy_wrapper(**kwargs):
+        return _dummy_wrapper(), {"backend": "dummy"}
+
+    monkeypatch.setattr("llm_das_dinomaly.pipelines.server_mvtec.build_dinomaly_wrapper", build_dummy_wrapper)
+    summary = run_pipeline(
+        {
+            "runtime": {"output_root": str(output_root), "device": "cpu", "progress": False},
+            "data": {"root": str(data_root), "categories": ["bottle"], "limit_per_category": 1},
+            "model": {"dinomaly_root": str(dinomaly_root), "checkpoint_path": str(checkpoint)},
+            "evaluation": {
+                "batch_size": 1,
+                "resize_mask": 16,
+                "limit_per_category": "all",
+                "beta": 0.05,
+                "beta_sweep": "0,0.05",
+            },
+        },
+        stage="eval",
+    )
+
+    metrics_dir = output_root / "metrics"
+    assert summary["evaluation"]["enhanced"]["mean"]["beta_sweep"]["primary_beta_key"] == "0.05"
+    assert (metrics_dir / "eval_enhanced.json").exists()
+    assert (metrics_dir / "eval_enhanced_beta_sweep.json").exists()
+    assert (metrics_dir / "eval_beta_sweep.json").exists()
+
+
 def test_server_pipeline_enhanced_eval_requires_saved_calibration(tmp_path, monkeypatch):
     data_root = _fake_mvtec(tmp_path / "mvtec")
     _fake_mvtec_test(data_root)
@@ -903,7 +989,13 @@ def test_server_pipeline_all_stage_writes_training_evaluation_metrics(tmp_path, 
             "model": {"dinomaly_root": str(dinomaly_root), "checkpoint_path": str(checkpoint)},
             "hard_samples": {"search_budget": 4, "max_samples": 1},
             "enhancer": {"hidden_dim": 4, "retrain": True},
-            "evaluation": {"batch_size": 1, "resize_mask": 16, "limit_per_category": "all"},
+            "evaluation": {
+                "batch_size": 1,
+                "resize_mask": 16,
+                "limit_per_category": "all",
+                "beta": 0.05,
+                "beta_sweep": "0,0.05",
+            },
         },
         stage="all",
     )
@@ -922,6 +1014,7 @@ def test_server_pipeline_all_stage_writes_training_evaluation_metrics(tmp_path, 
     assert (metrics_dir / "baseline_eval.json").exists()
     assert (metrics_dir / "baseline_eval.progress.json").exists()
     assert (metrics_dir / "enhancer_epoch_0001.json").exists()
+    assert (metrics_dir / "enhancer_epoch_0001_beta_sweep.json").exists()
     assert (metrics_dir / "enhancer_epochs.jsonl").exists()
     epoch_records = [
         line for line in (metrics_dir / "enhancer_epochs.jsonl").read_text(encoding="utf-8").splitlines() if line
@@ -930,6 +1023,7 @@ def test_server_pipeline_all_stage_writes_training_evaluation_metrics(tmp_path, 
     assert '"epoch": 1' in epoch_records[0]
     assert "stale" not in epoch_records[0]
     assert (metrics_dir / "final_enhanced_eval.json").exists()
+    assert (metrics_dir / "final_enhanced_eval_beta_sweep.json").exists()
 
 
 def test_server_pipeline_reused_real_enhancer_writes_final_enhanced_eval(tmp_path, monkeypatch):
@@ -989,14 +1083,25 @@ def test_server_pipeline_reused_real_enhancer_writes_final_enhanced_eval(tmp_pat
             "model": {"dinomaly_root": str(dinomaly_root), "checkpoint_path": str(checkpoint)},
             "hard_samples": {"search_budget": 4, "max_samples": 1},
             "enhancer": {"hidden_dim": 4},
-            "evaluation": {"batch_size": 1, "resize_mask": 16, "limit_per_category": "all"},
+            "evaluation": {
+                "batch_size": 1,
+                "resize_mask": 16,
+                "limit_per_category": "all",
+                "beta": 0.05,
+                "beta_sweep": "0,0.05,0.1",
+                "beta_selection_metric": "image_auroc",
+            },
         },
         stage="all",
     )
 
     assert summary["enhancer"]["reused"] is True
     assert summary["evaluation"]["final_enhanced"]["mean"]["enhanced"]["num_categories"] == 1
+    assert summary["evaluation"]["final_enhanced"]["mean"]["beta_sweep"]["primary_beta_key"] == "0.05"
+    assert "0.1" in summary["evaluation"]["final_enhanced"]["mean"]["enhanced_by_beta"]
     assert (output_root / "metrics" / "final_enhanced_eval.json").exists()
+    assert (output_root / "metrics" / "final_enhanced_eval_beta_sweep.json").exists()
+    assert (output_root / "metrics" / "final_enhanced_beta_sweep.json").exists()
 
 
 def test_server_pipeline_retrains_legacy_enhancer_missing_calibration(tmp_path, monkeypatch):

@@ -32,7 +32,9 @@ base_training:
 few_shot_training:
   base_total_iters: ${FEW_SHOT_BASE_TOTAL_ITERS:-2000}
   base_eval_interval: ${FEW_SHOT_BASE_EVAL_INTERVAL:-1000}
-  enhancer_epochs: ${FEW_SHOT_ENHANCER_EPOCHS:-10}
+  enhancer_epochs: ${FEW_SHOT_ENHANCER_EPOCHS:-1}
+  enhancer_hidden_dim: ${FEW_SHOT_ENHANCER_HIDDEN_DIM:-64}
+  enhancer_lr: ${FEW_SHOT_ENHANCER_LR:-0.0001}
 
 hard_samples:
   search_budget: ${SEARCH_BUDGET:-4}
@@ -57,3 +59,5 @@ evaluation:
   pixel_aupro: ${EVAL_PIXEL_AUPRO:-false}
   epoch_pixel_metrics: ${EVAL_EPOCH_PIXEL_METRICS:-false}
   beta: ${EVAL_FUSION_BETA:-1.0}
+  beta_sweep: ${EVAL_FUSION_BETA_SWEEP:-}
+  beta_selection_metric: ${EVAL_BETA_SELECTION_METRIC:-image_auroc}
